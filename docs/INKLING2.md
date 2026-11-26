@@ -547,3 +547,5 @@ start: checked on Windows, an RTX 5080 with an RTX 4060 Ti; refused where the co
 through host memory); the drafter is one GPU's.  Not done: the loop in the layer-major prompt passes (`IK2_SUP`: off
 for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it), the drafter's own launches
 as a graph (2-3 ms a step now).
+
+The experimental RTX 3090 Q4_K/Q5_0 row-dot A/B is recorded in [INKLING2-RTX3090-AB.md](INKLING2-RTX3090-AB.md).
