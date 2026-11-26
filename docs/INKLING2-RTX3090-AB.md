@@ -57,3 +57,23 @@ The Q5_0 paired row-dot loop now hoists lane-invariant nibble/high-bit indexes a
 | Paired Q4_K + Q5_0 pointer hoist | 66.62, 67.05 | 66.84 |
 
 That is a 3.0% gain in this two-run check. The generated token IDs matched exactly across all four runs (same SHA-256 as above), and the full CUDA kernel test executable ended with `all passed`. This small change is retained because it improved the measured path without changing the output; more repetitions are needed to estimate the size of the gain precisely.
+
+## Published Maya fast path comparison
+
+I built the separate public `alesha-pro/maya-inkling-mini` checkout (`27daec5`) for the RTX 3090 and tested its own Unsloth `Inkling-2-Mini-UD-Q4_K_XL.gguf` plus the Thinking Machines MTP drafter. This is a different expert quant from the AtomicChat file above: the Unsloth file stores experts as NVFP4, while AtomicChat stores Q4_K/Q5_0. The reference engine rejects the AtomicChat expert tensor (`Q4_K not decoded here`), so these results do not establish speed or refusal behavior for the uncensored checkpoint.
+
+The public checkout needed a local loader compatibility patch before the test was valid. This GGUF uses `general.architecture=inkling2_loop`, `loop.count/start/end`, and one `blk.N.loop_msg_query.weight` per loop layer. The unmodified checkout expected the older metadata and silently treated the three-pass loop as one pass; its resulting 235 tok/s run emitted repeating special tokens and is invalid. After mapping the current metadata and tensors, the log correctly reported layers 6–17 repeated three times (48 visits per token). Prompts were encoded with this GGUF's tokenizer and Maya's Inkling template.
+
+On a 505-token coding prompt at 65,536 context, FP8 KV, all experts resident, and the MTP drafter enabled:
+
+| Draft width | Generated tokens | Decode speed | Draft acceptance |
+| ---: | ---: | ---: | ---: |
+| 5 (default) | 599 | 171.13 tok/s | 3.67 per window |
+| 8 | 599 | 199.89 tok/s | 5.44 per window |
+| 8 | 1,099 | 194.14 tok/s | 5.14 per window |
+
+The first 600 token IDs were identical between widths 5 and 8 (SHA-256 `63028cff9b91ca312a3917d03c63ee730c38b82a2ea56dbb1e53b664db6bf275`). The longer run produced the requested implementation and tests; this is a throughput sample, not a code correctness certification. The single prompt makes the speed content-dependent. It demonstrates about 200 tok/s on this GPU with this supported quant and direct coding output, but does not show that all replies or the AtomicChat quant run at 200 tok/s. The published guide's 211.6 tok/s figure is for an editing prompt; its DSH three-file agent report is 150–167 tok/s. The reference guide's main speed runs use Linux; this local test ran under Windows WDDM/MSVC.
+
+At 262,144 context, the Windows build had too little room for full expert residency plus drafting and reported drafting disabled. At 233,472, it fit the intended fast path but used almost all VRAM and prefilled this short prompt at only 14.6 tok/s, so I stopped that run. The 65,536 result is the useful local comparison. The existing AtomicChat row-dot path remains the relevant speed for the uncensored file until a tensor-core-compatible quant is built and its behavior is checked.
+
+Raw logs are retained under `build/maya-inkling-test/reference-build/` (ignored by Git). The compatibility patch remains in the separate reference checkout; it was not copied into the personal fork because that fork already reads the looped metadata and per-layer message-query tensors.
