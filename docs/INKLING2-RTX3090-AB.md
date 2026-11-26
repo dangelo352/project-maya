@@ -33,3 +33,16 @@ $env:IK2_KV = 'fp8'
 maya-ik2.exe --model <model.gguf> --tokens @<prompt.ids> --gen 256 --ctx 8192 --drafting off
 maya-ik2.exe --model <model.gguf> --tokens @<prompt.ids> --gen 256 --ctx 8192 --draft <dspark.gguf> --drafting on
 ```
+
+## Paired Q4_K subgroup follow-up
+
+After the first A/B, `row_dot_2`'s Q4_K path was changed to hoist each block's scale/minimum values and decode each packed byte's two nibbles together. This comparison uses the saved first optimized executable (`d7e25c3e`) as baseline and the paired-subgroup build as candidate. It is the same RTX 3090, model file, prompt, 8,192-token context, FP8 KV, and 255 measured output tokens; the six runs were interleaved to reduce drift.
+
+| Build | Runs (tok/s) | Mean |
+| --- | ---: | ---: |
+| Previous optimized build | 41.51, 41.62, 41.84 | 41.66 |
+| Paired Q4_K subgroup candidate | 57.41, 57.23, 57.20 | 57.28 |
+
+The paired path is 37.5% faster on this prompt. All six runs generated the same token IDs (SHA-256 of the generated-ID line: `3AA9AB73D8AEDF2F947CA2C41A85402B07887841EF5EA7C0199178CBDF129E91`). The complete `ik2_kernels_test.exe` suite ended with `all passed` after rebuilding the candidate for Windows, CUDA 12.8, sm_86.
+
+This does not explain the much higher 110–125 tok/s reports for the separate Unsloth UD-Q4_K_XL path: that file stores its routed experts as NVFP4 and uses Maya's dedicated tensor-core expert kernels, while this AtomicChat AD-Q4_K file stores its experts as Q4_K/Q5_0 and takes the scalar row-dot path. Other builds and quant formats are not directly comparable. No per-run GPU power trace was captured, and the result is still one short prompt at 8K context; see the logs under `build/maya-inkling-test/` for the local raw runs.
