@@ -6,7 +6,7 @@
 //   * a head's attention weights: the relative bias out to the extent, the window, the sink, queries and keys at
 //     offsets (a chunk of a prompt against the cache);
 //   * the router (the picks as a set and the weights), the softcapped SwiGLU with the experts' scales, the combine;
-//   * the decodes (NVFP4, Q8_0, Q5_K, Q6_K): the device's F32 values bit for bit the host's, FP16 = F32 rounded (NVFP4:
+//   * the decodes (NVFP4, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K): the device's F32 values bit for bit the host's, FP16 = F32 rounded (NVFP4:
 //     exact), NVFP4 against the format's definition.  (Q8_0 / Q5_K / Q6_K against ggml's values: not here yet - the
 //     real model's seams cover them.)
 #include "../src/ik2/ik2_iq_tables.h"
@@ -101,6 +101,106 @@ float h2f_host(uint16_t h) {
     return (sign ? -1.0f : 1.0f) * std::ldexp(1.0f + (float) m / 1024.0f, (int) e - 15);
 }
 uint16_t f2h_host(float f) { return (uint16_t) __half_as_ushort(__float2half_rn(f)); }
+
+// GGML dequantize_row_q4_K reference shape: walk the super-block as four groups of 64, each
+// with two 32-value scale/min pairs, writing the low nibbles then the high nibbles.
+void ggml_q4k_reference(const uint8_t* blocks, size_t n, float* out) {
+    for (size_t base = 0; base < n; base += 256, blocks += 144) {
+        const float d = h2f_host((uint16_t) (blocks[0] | (blocks[1] << 8)));
+        const float dmin = h2f_host((uint16_t) (blocks[2] | (blocks[3] << 8)));
+        const uint8_t* q = blocks + 16;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            auto scale_min = [&](int index, int& sc, int& m) {
+                if (index < 4) {
+                    sc = blocks[4 + index] & 63;
+                    m = blocks[4 + index + 4] & 63;
+                } else {
+                    sc = (blocks[4 + index + 4] & 0xF) | ((blocks[4 + index - 4] >> 6) << 4);
+                    m = (blocks[4 + index + 4] >> 4) | ((blocks[4 + index] >> 6) << 4);
+                }
+            };
+            int sc1, m1, sc2, m2;
+            scale_min(is, sc1, m1);
+            scale_min(is + 1, sc2, m2);
+            const float d1 = d * (float) sc1, m1f = dmin * (float) m1;
+            const float d2 = d * (float) sc2, m2f = dmin * (float) m2;
+            for (int l = 0; l < 32; ++l) out[base + j + l] = d1 * (float) (q[l] & 0xF) - m1f;
+            for (int l = 0; l < 32; ++l) out[base + j + 32 + l] = d2 * (float) (q[l] >> 4) - m2f;
+            q += 32;
+            is += 2;
+        }
+    }
+}
+
+// GGML dequantize_row_q5_0 reference: 5-bit values are the low nibble plus one high-plane bit,
+// offset by 16 and scaled by the block's FP16 d.
+void ggml_q5_0_reference(const uint8_t* blocks, size_t n, float* out) {
+    for (size_t base = 0; base < n; base += 32, blocks += 22) {
+        const float d = h2f_host((uint16_t) (blocks[0] | (blocks[1] << 8)));
+        const uint32_t qh = (uint32_t) blocks[2] | ((uint32_t) blocks[3] << 8) |
+                            ((uint32_t) blocks[4] << 16) | ((uint32_t) blocks[5] << 24);
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t ql = blocks[6 + j];
+            const int x0 = (ql & 0xF) | (((qh >> j) & 1) << 4);
+            const int x1 = (ql >> 4) | (((qh >> (j + 16)) & 1) << 4);
+            out[base + j] = (float) (x0 - 16) * d;
+            out[base + j + 16] = (float) (x1 - 16) * d;
+        }
+    }
+}
+
+void decode_reference(int type, const uint8_t* blocks, size_t n, float* out) {
+    if (type == k::kQ4_K) ggml_q4k_reference(blocks, n, out);
+    else if (type == k::kQ5_0) ggml_q5_0_reference(blocks, n, out);
+    else k::decode_host(type, blocks, n, out);
+}
+
+void test_ggml_decode_parity() {
+    for (const int type : {k::kQ5_0, k::kQ4_K}) {
+        const size_t bv = (size_t) k::block_values(type), bb = k::block_bytes(type), nb = 7, n = bv * nb;
+        expect_true(type == k::kQ4_K ? "Q4_K GGML geometry (256 values / 144 bytes)"
+                                     : "Q5_0 GGML geometry (32 values / 22 bytes)",
+                    bv == (type == k::kQ4_K ? 256u : 32u) && bb == (type == k::kQ4_K ? 144u : 22u));
+        std::vector<uint8_t> raw(nb * bb, 0);
+        for (size_t b = 0; b < nb; ++b) {
+            uint8_t* block = raw.data() + b * bb;
+            const uint16_t d = f2h_host(type == k::kQ4_K ? 0.0625f * (float) (b + 1) : 0.125f * (float) (b + 1));
+            block[0] = (uint8_t) d, block[1] = (uint8_t) (d >> 8);
+            if (type == k::kQ4_K) {
+                const uint16_t dm = f2h_host(0.03125f * (float) (b + 1));
+                block[2] = (uint8_t) dm, block[3] = (uint8_t) (dm >> 8);
+                for (int i = 0; i < 12; ++i) block[4 + i] = (uint8_t) (17 * i + 29 * b + 0xA7);
+                for (int i = 0; i < 128; ++i) block[16 + i] = (uint8_t) (73 * i + 41 * b + 0x5D);
+            } else {
+                for (int i = 0; i < 4; ++i) block[2 + i] = (uint8_t) (0x96 ^ (31 * i + 17 * b));
+                for (int i = 0; i < 16; ++i) block[6 + i] = (uint8_t) (61 * i + 37 * b + 0xB3);
+            }
+        }
+        std::vector<float> ref(n), got(n);
+        decode_reference(type, raw.data(), n, ref.data());
+        k::decode_host(type, raw.data(), n, got.data());
+        std::vector<double> refd(ref.begin(), ref.end());
+        expect(type == k::kQ4_K ? "host Q4_K = GGML dequant, every value" : "host Q5_0 = GGML dequant, every value",
+               got, refd, 0.0, 0.0);
+
+        uint8_t* dr = dev(raw);
+        float* d32 = dev_n<float>(n);
+        uint16_t* d16 = dev_n<uint16_t>(n);
+        k::decode_f32(type, dr, n, d32, 0);
+        k::decode_f16(type, dr, n, d16, 0);
+        const auto g32 = host(d32, n);
+        const auto g16 = host(d16, n);
+        bool same_f32 = std::memcmp(g32.data(), ref.data(), n * sizeof(float)) == 0;
+        bool same_f16 = true;
+        for (size_t i = 0; i < n; ++i) same_f16 &= g16[i] == f2h_host(ref[i]);
+        expect_true(type == k::kQ4_K ? "GPU Q4_K F32 = GGML, bit for bit" : "GPU Q5_0 F32 = GGML, bit for bit",
+                    same_f32);
+        expect_true(type == k::kQ4_K ? "GPU Q4_K F16 = rounded GGML, every value" : "GPU Q5_0 F16 = rounded GGML, every value",
+                    same_f16);
+        cudaFree(dr), cudaFree(d32), cudaFree(d16);
+    }
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -603,13 +703,15 @@ void test_decode() {
                 h = (uint16_t) ((h & 0x83FF) | ((uint16_t) (8 + (h >> 10) % 8) << 10));
                 p[0] = (uint8_t) h, p[1] = (uint8_t) (h >> 8);
             };
+            if (type == k::kQ5_0) fix(0);
             if (type == k::kQ8_0) fix(0);
+            if (type == k::kQ4_K) fix(0), fix(2);
             if (type == k::kQ5_K) fix(0), fix(2);
             if (type == k::kQ6_K) fix(208);
         if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
         }
         std::vector<float> hostv(n);
-        k::decode_host(type, raw.data(), n, hostv.data());
+        decode_reference(type, raw.data(), n, hostv.data());
         uint8_t* dr = dev(raw);
         float* d32 = dev_n<float>(n);
         uint16_t* d16 = dev_n<uint16_t>(n);
@@ -651,7 +753,9 @@ std::vector<uint8_t> rand_blocks(int type, size_t n_values) {
             h = (uint16_t) ((h & 0x83FF) | ((uint16_t) (8 + (h >> 10) % 8) << 10));
             p[0] = (uint8_t) h, p[1] = (uint8_t) (h >> 8);
         };
+        if (type == k::kQ5_0) fix(0);
         if (type == k::kQ8_0) fix(0);
+        if (type == k::kQ4_K) fix(0), fix(2);
         if (type == k::kQ5_K) fix(0), fix(2);
         if (type == k::kQ6_K) fix(208);
         if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
@@ -729,6 +833,8 @@ void test_experts_mv() {
         const char* name;
     };
     const Case cases[] = {{k::kNVFP4, k::kNVFP4, k::kNVFP4, "NVFP4"},
+                          {k::kQ5_0, k::kQ5_0, k::kQ5_0, "Q5_0"},
+                          {k::kQ4_K, k::kQ4_K, k::kQ4_K, "Q4_K"},
                           {k::kQ5_K, k::kQ5_K, k::kQ6_K, "Q5_K / Q6_K"},
                           {k::kQ8_0, k::kNVFP4, k::kQ6_K, "mixed"},
                           {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4, "IQ3_XXS / NVFP4"},
@@ -775,13 +881,13 @@ void test_experts_mv() {
                 const int ty = up ? cs.tu : cs.tg;
                 const uint8_t* w = (up ? u.data() + e * eb1 : g.data() + e * eb0) + (size_t) rr * (eb0 / F);
                 if (up) w = u.data() + e * eb1 + (size_t) rr * (eb1 / F);
-                k::decode_host(ty, w, C, row.data());
+                decode_reference(ty, w, C, row.data());
                 double a = 0;
                 for (int c = 0; c < C; ++c) a += (double) row[c] * x[(size_t) tok[i] * C + c];
                 want_gu[(size_t) i * 2 * F + r] = a;
             }
             for (int r = 0; r < C; ++r) {
-                k::decode_host(cs.td, d.data() + e * eb2 + (size_t) r * (eb2 / C), F, row.data());
+                decode_reference(cs.td, d.data() + e * eb2 + (size_t) r * (eb2 / C), F, row.data());
                 double a = 0;
                 for (int c = 0; c < F; ++c) a += (double) row[c] * hf[(size_t) i * F + c];
                 want_y[(size_t) i * C + r] = a;
@@ -923,6 +1029,8 @@ void test_mv_blocks() {
         const char* name;
     };
     const Case cases[] = {
+        {k::kQ5_0, 513, 4608, "Q5_0 N=513"},
+        {k::kQ4_K, 513, 4608, "Q4_K N=513"},
         {k::kQ8_0, 384, 4608, "Q8_0 N=384"},
         {k::kQ8_0, 1031, 6144, "Q8_0 N=1031"},
         {k::kQ8_0, 2307, 4608, "Q8_0 N=2307"},
@@ -944,7 +1052,7 @@ void test_mv_blocks() {
         std::vector<float> row(K);
         const size_t rb = raw.size() / N;
         for (int r = 0; r < N; ++r) {
-            k::decode_host(cs.type, raw.data() + (size_t) r * rb, K, row.data());
+            decode_reference(cs.type, raw.data() + (size_t) r * rb, K, row.data());
             double a = 0;
             for (int c = 0; c < K; ++c) a += (double) row[c] * x[c];
             want[r] = a;
@@ -3249,6 +3357,13 @@ int main() {
         std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
         return g_fail ? 1 : 0;
     }
+    if (getenv("IK2_TEST_QUANT_BLOCKS_ONLY")) {
+        test_ggml_decode_parity();
+        test_experts_mv();
+        test_mv_blocks();
+        std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
     test_rms();
     test_l2clip();
     test_conv();
@@ -3256,6 +3371,7 @@ int main() {
     test_attn_probs();
     test_route();
     test_moe_pieces();
+    test_ggml_decode_parity();
     test_decode();
     test_iq_ref();
     test_experts_mv();

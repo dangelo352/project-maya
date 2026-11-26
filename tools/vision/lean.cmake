@@ -57,7 +57,7 @@ ${_stubs}")
   message(STATUS "maya-vision: ${_n_in} projector files (${MAYA_VISION_TOWERS}), ${_n_out} of llama.cpp's left out")
 endif()
 
-# ---- 2. ggml's CUDA / HIP backend: no quantized-weight matmul kernels (one template instance per GGUF quant type).
+# ---- 2. ggml's CUDA / HIP backend: keep Q8_0 matmul for quantized Inkling projectors; other quant types stop.
 # mmq.cu - which decides when they run, and calls them - stays; an instance left out is one that stops.
 foreach(_t ggml-cuda ggml-hip)
   if(NOT TARGET ${_t})
@@ -77,6 +77,11 @@ foreach(_t ggml-cuda ggml-hip)
         list(APPEND _keep ${_f})                       # (not the file this expects: compiled as it is)
         continue()
       endif()
+      if(_ty STREQUAL "GGML_TYPE_Q8_0")
+        # Inkling mmproj files use Q8_0 for projector weights. Keep ggml's native kernel intact.
+        list(APPEND _keep ${_f})
+        continue()
+      endif()
       string(APPEND _inst "template void mul_mat_q_case<${_ty}>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);\n")
     else()
       list(APPEND _keep ${_f})
@@ -89,7 +94,7 @@ foreach(_t ggml-cuda ggml-hip)
     get_filename_component(_cuda_dir ${_like} ABSOLUTE BASE_DIR ${_tdir})
     get_filename_component(_cuda_dir ${_cuda_dir} DIRECTORY)
     set(_stub ${CMAKE_BINARY_DIR}/maya-lean/mmq_left_out.cu)
-    _maya_write_if_changed(${_stub} "// written by tools/vision/lean.cmake: the quantized-weight matmul kernels this build leaves out stop here
+    _maya_write_if_changed(${_stub} "// written by tools/vision/lean.cmake: quantized-weight matmul kernels other than Q8_0 stop here
 // (the same declaration as mmq.cuh's mul_mat_q_case, whose instances mmq.cu calls)
 #include \"${_cuda_dir}/common.cuh\"
 #include <cstdio>
@@ -98,8 +103,8 @@ struct mmq_args;
 template <ggml_type type>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     (void) ctx; (void) args; (void) stream;
-    std::fprintf(stderr, \"maya-vision: this build has no kernels for quantized weights (ggml type %d): an mmproj's \"
-                         \"are F32/F16; -DMAYA_VISION_FULL=ON builds them\\n\", (int) type);
+    std::fprintf(stderr, \"maya-vision: this lean build has no kernel for quantized weight type %d (Q8_0 is supported); \"
+                         \"-DMAYA_VISION_FULL=ON builds all quantized kernels\\n\", (int) type);
     std::abort();
 }
 ${_inst}")

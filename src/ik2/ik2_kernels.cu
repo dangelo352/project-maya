@@ -2831,6 +2831,15 @@ __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
 }
 
 __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, size_t v) {
+    if (type == kQ5_0) {   // GGML block_q5_0: FP16 scale, 32 high bits, 16 packed low-nibble bytes
+        const uint8_t* b = blocks + (v / 32) * 22;
+        const int i = (int) (v % 32), j = i & 15;
+        const uint8_t packed = b[6 + j];
+        const int ql = i < 16 ? (packed & 0xF) : (packed >> 4);
+        const int qh = (b[2 + (i >> 3)] >> (i & 7)) & 1;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        return d * (float) ((ql | (qh << 4)) - 16);
+    }
     if (type == kNVFP4) {
         const int8_t kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
         const uint8_t* b = blocks + (v / 64) * 36;
@@ -2842,6 +2851,24 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
         const uint8_t* b = blocks + (v / 32) * 34;
         const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
         return d * (float) (int8_t) b[2 + v % 32];
+    }
+    if (type == kQ4_K) {   // GGML block_q4_K: d, dmin, 12 packed 6-bit scales/mins, 128 nibble bytes
+        const uint8_t* b = blocks + (v / 256) * 144;
+        const int i = (int) (v % 256), is = i / 32, j = i % 32;
+        const uint8_t* scales = b + 4;
+        int sc, m;
+        if (is < 4) {
+            sc = scales[is] & 63;
+            m = scales[is + 4] & 63;
+        } else {
+            sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
+            m = (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4);
+        }
+        const uint8_t q = b[16 + (is / 2) * 32 + j];
+        const int qi = (is & 1) ? (q >> 4) : (q & 0xF);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float dmin = half_bits_to_float((uint16_t) (b[2] | (b[3] << 8)));
+        return (d * (float) sc) * (float) qi - (dmin * (float) m);
     }
     if (type == kQ6_K) {   // ql [128], qh [64], scales int8 [16], d
         const uint8_t* b = blocks + (v / 256) * 210;
@@ -5327,6 +5354,27 @@ __global__ void decode_f16_k_kernel(int type, const uint8_t* blocks, size_t nblk
     const int lane = threadIdx.x & 31;
     const int gr = lane >> 3, l0 = (lane & 7) * 4;
     uint16_t* y = out + bi * 256;
+    if (type == kQ4_K) {
+        const uint8_t* b = blocks + bi * 144;
+        const uint8_t* scales = b + 4;
+        const float d = half_bits_to_float((uint16_t) (__ldg(b) | (__ldg(b + 1) << 8)));
+        const float dmin = half_bits_to_float((uint16_t) (__ldg(b + 2) | (__ldg(b + 3) << 8)));
+        for (int is = 0; is < 8; ++is) {
+            int sc, m;
+            if (is < 4) {
+                sc = __ldg(scales + is) & 63;
+                m = __ldg(scales + is + 4) & 63;
+            } else {
+                const uint8_t a = __ldg(scales + is + 4), z = __ldg(scales + is - 4), t = __ldg(scales + is);
+                sc = (a & 0xF) | ((z >> 6) << 4);
+                m = (a >> 4) | ((t >> 6) << 4);
+            }
+            const uint8_t q = __ldg(b + 16 + (is / 2) * 32 + lane);
+            const int qi = (is & 1) ? (q >> 4) : (q & 0xF);
+            y[is * 32 + lane] = f2h((d * (float) sc) * (float) qi - (dmin * (float) m));
+        }
+        return;
+    }
     if (type == kQ6_K) {
         const uint8_t* b = blocks + bi * 210;
         const float d = half_bits_to_float((uint16_t) (b[208] | (b[209] << 8)));
@@ -7592,11 +7640,11 @@ void argmax_gemv_i8(const int8_t* W, int ld, const float* xs, const float* base,
 }
 
 int block_values(int type) {
-    return type == kNVFP4 ? 64 : type == kQ8_0 ? 32
-         : type == kQ5_K || type == kQ6_K || type == kIQ3_XXS || type == kIQ4_XS ? 256 : 0;
+    return type == kNVFP4 ? 64 : type == kQ5_0 || type == kQ8_0 ? 32
+         : type == kQ4_K || type == kQ5_K || type == kQ6_K || type == kIQ3_XXS || type == kIQ4_XS ? 256 : 0;
 }
 size_t block_bytes(int type) {
-    return type == kNVFP4 ? 36 : type == kQ8_0 ? 34 : type == kQ5_K ? 176 : type == kQ6_K ? 210
+    return type == kNVFP4 ? 36 : type == kQ5_0 ? 22 : type == kQ8_0 ? 34 : type == kQ4_K ? 144 : type == kQ5_K ? 176 : type == kQ6_K ? 210
          : type == kIQ3_XXS ? 98 : type == kIQ4_XS ? 136 : 0;
 }
 
@@ -8128,7 +8176,7 @@ void decode_f16(int type, const uint8_t* blocks, size_t n, uint16_t* out, cudaSt
         check("decode_f16_iq");
         return;
     }
-    if ((type == kQ5_K || type == kQ6_K) && n % 256 == 0) {
+    if ((type == kQ4_K || type == kQ5_K || type == kQ6_K) && n % 256 == 0) {
         decode_f16_k_kernel<<<grid(n / 256, kBlk / 32), kBlk, 0, s>>>(type, blocks, n / 256, out);
         check("decode_f16_k");
         return;

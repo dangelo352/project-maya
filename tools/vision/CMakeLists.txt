@@ -60,8 +60,7 @@ endif()
 # same inputs - so a picture's embeddings are the same bits; what is left out is replaced by a function that stops
 # with a message (below):
 #  - mtmd's projector files other than the towers of the models Maya runs (MAYA_VISION_TOWERS);
-#  - ggml's quantized-weight matmul kernels (MMQ, one instance per GGUF quant type): an mmproj's weights are F32/F16
-#    (maya-vision refuses, at its start, an mmproj with a quantized tensor);
+#  - ggml's quantized-weight matmul kernels (MMQ, one instance per GGUF quant type) except Q8_0, needed by Inkling;
 #  - flash attention for quantized or BF16 keys/values (a text model's KV cache types; the encoder's are F16).
 option(MAYA_VISION_FULL "compile every projector and kernel of llama.cpp's image library, not only what Maya's towers use" OFF)
 set(MAYA_VISION_TOWERS "glm5next;inkling2v;qwen2vl;qwen3vl" CACHE STRING "tools/mtmd/models/<name>.cpp files that are compiled")

@@ -134,11 +134,13 @@ int main(int argc, char** argv) {
         const int64_t k = gg ? gguf_find_key(gg, "clip.vision.projection_dim") : -1;
         if (k >= 0) n_embd = (int) gguf_get_val_u32(gg, k);
 #ifdef MAYA_VISION_LEAN
-        // this build has no kernels for quantized weights (tools/vision/lean.cmake): said here, not mid-picture
+        // Q8_0 is supported by ggml's CPU path and the lean CUDA/HIP build; fail early for other quantized types.
         for (int64_t i = 0; gg && i < gguf_get_n_tensors(gg); ++i) {
-            if (!ggml_is_quantized(gguf_get_tensor_type(gg, i))) continue;
-            std::printf("ERR the vision encoder %s has quantized weights (%s): this maya-vision is built for F32/F16 "
-                        "ones (-DMAYA_VISION_FULL=ON builds the others)\n", mmproj.c_str(), gguf_get_tensor_name(gg, i));
+            const enum ggml_type type = gguf_get_tensor_type(gg, i);
+            if (!ggml_is_quantized(type) || type == GGML_TYPE_Q8_0) continue;
+            std::printf("ERR the vision encoder %s has unsupported quantized weights (%s, type %s): this lean "
+                        "maya-vision build supports Q8_0 projector weights\n", mmproj.c_str(),
+                        gguf_get_tensor_name(gg, i), ggml_type_name(type));
             std::fflush(stdout);
             return 1;
         }

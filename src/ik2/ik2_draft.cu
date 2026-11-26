@@ -1,5 +1,6 @@
 // src/ik2/ik2_draft.cu - maya-ik2's drafter (the design: ik2_draft.hpp).
 #include "ik2_draft.hpp"
+#include "ik2_draft_metadata.hpp"
 #include "ik2_kernels.cuh"
 #include "maya/artifact/gguf_reader.hpp"
 
@@ -311,7 +312,10 @@ void check_gguf(const maya::GgufFile& g, int C, int layers, int H, int KV, int F
     want("dflash.attention.head_count_kv", KV);
     want("dflash.feed_forward_length", F);
     want("dflash.attention.key_length", 128);
-    want("dflash.attention.sliding_window", 1024);
+    if (!ik2::draft::gguf_window_matches_inkling_draft(num("dflash.attention.sliding_window")))
+        throw std::runtime_error("drafter: the GGUF's dflash.attention.sliding_window is " +
+                                 std::to_string(num("dflash.attention.sliding_window")) +
+                                 ", this model's drafter expects 1024 (GGUF may encode it as 1025)");
     want("dflash.rope.freq_base", 1e6);
     if (std::fabs(num("dflash.attention.layer_norm_rms_epsilon") - 1e-6) > 1e-9)
         throw std::runtime_error("drafter: the GGUF's RMS epsilon is not 1e-6");

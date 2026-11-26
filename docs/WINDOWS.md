@@ -7,6 +7,10 @@ compile there with Visual Studio 2022 and CUDA 12.8 (CUDA 13 works for RTX 20 an
 and measured on Linux; on Windows 11 a user runs Maya-L on an RTX 4090, built with CUDA 13.4 (the speed table above,
 [#63](https://github.com/mw00/project-maya/issues/63)). Tell us how it runs on yours.
 
+**Inkling-2-Mini** also supports native Windows with CUDA 12.8, Visual Studio 2022 and one NVIDIA GPU. AMD on Windows
+and WSL2 are not supported for this model. See [the model notes](MODELS.md#inkling-2-mini) for its GPU and memory
+requirements.
+
 1. Install once:
    - The NVIDIA driver and [CUDA Toolkit 12.8](https://developer.nvidia.com/cuda-12-8-0-download-archive).
      CUDA 13 also works for RTX 20 and newer; V100 needs CUDA 12.x. The CUDA version shown by `nvidia-smi` is the

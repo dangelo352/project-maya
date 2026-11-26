@@ -55,6 +55,16 @@ The conventions a kernel must follow (the conversion folds them in):
   pick only, not the weights).
 - Not in the file: the drafter and the vision tower (the PR leaves them out; unsloth ships the tower as `mmproj`).
 
+`maya-ik2` also reads the merged `inkling2_loop` GGUF layout used by current llama.cpp conversions. That layout stores
+the 24 unique model layers plus loop metadata (rather than 48 expanded visits), per-layer cross-pass queries, and
+the `q` / `k` / `v` / `ffn` controller names. The engine expands the repeated visits at runtime and maps those tensors
+to the same forward pass; it does not rewrite the model file. The expert path also accepts Q4_K and Q5_0 blocks,
+including a fused gate/up tensor when the split between gate and up is not itself block-aligned.
+
+On native Windows, build `maya-ik2` with CUDA 12.8, Visual Studio 2022 and the RTX 3090's `sm_86` architecture. The
+optional `maya-vision` target reads Inkling's `inkling2v` projector; Q8_0 projector weights are retained in the lean
+build. The Q8_0 projector was exercised through the OpenAI-compatible image endpoint.
+
 ## 3. The reference: `ref/inkling2.py`
 
 The forward pass over any `inkling2` GGUF, op by op in float64, in ref/glm.py's conventions (weights `(out, in)` from
