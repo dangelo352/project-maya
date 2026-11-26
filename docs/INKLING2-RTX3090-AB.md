@@ -46,3 +46,14 @@ After the first A/B, `row_dot_2`'s Q4_K path was changed to hoist each block's s
 The paired path is faster in both modes on this prompt. All ten runs generated the same token IDs (SHA-256 of the generated-ID line: `3AA9AB73D8AEDF2F947CA2C41A85402B07887841EF5EA7C0199178CBDF129E91`). The complete `ik2_kernels_test.exe` suite ended with `all passed` after rebuilding the candidate for Windows, CUDA 12.8, sm_86.
 
 This does not explain the much higher 110–125 tok/s reports for the separate Unsloth UD-Q4_K_XL path: that file stores its routed experts as NVFP4 and uses Maya's dedicated tensor-core expert kernels, while this AtomicChat AD-Q4_K file stores its experts as Q4_K/Q5_0 and takes the scalar row-dot path. Other builds and quant formats are not directly comparable. No per-run GPU power trace was captured, and the result is still one short prompt at 8K context; see the logs under `build/maya-inkling-test/` for the local raw runs.
+
+## Q5_0 down-projection loop follow-up
+
+The Q5_0 paired row-dot loop now hoists lane-invariant nibble/high-bit indexes and advances each row pointer by its 22-byte block stride. The FP32 accumulation and index order are unchanged. Compared with the paired-Q4 build immediately before it, under the same DSpark-on prompt and settings:
+
+| Build | Runs (tok/s) | Mean |
+| --- | ---: | ---: |
+| Paired Q4_K build | 64.24, 65.58 | 64.91 |
+| Paired Q4_K + Q5_0 pointer hoist | 66.62, 67.05 | 66.84 |
+
+That is a 3.0% gain in this two-run check. The generated token IDs matched exactly across all four runs (same SHA-256 as above), and the full CUDA kernel test executable ended with `all passed`. This small change is retained because it improved the measured path without changing the output; more repetitions are needed to estimate the size of the gain precisely.

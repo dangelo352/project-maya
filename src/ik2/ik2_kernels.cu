@@ -3349,16 +3349,18 @@ __device__ void row_dot_2(int type, const uint8_t* wg, const uint8_t* wu, const 
             au += iq3 ? iq3xxs_sub_dot(wu + off, sb & 7, xv) : iq4xs_sub_dot(wu + off, sb & 7, xv);
         }
     } else if (type == kQ5_0) {
-        for (int i = lane; i < K; i += 32) {
-            const int in_block = i & 31;
-            const int j = in_block & 15;
-            const uint8_t* bg = wg + (size_t) (i / 32) * 22;
-            const uint8_t* bu = wu + (size_t) (i / 32) * 22;
+        const int j = lane & 15;
+        const int qh_byte = lane >> 3;
+        const int qh_shift = lane & 7;
+        const bool low_nibble = lane < 16;
+        const uint8_t* bg = wg;
+        const uint8_t* bu = wu;
+        for (int i = lane; i < K; i += 32, bg += 22, bu += 22) {
             const uint8_t pg = __ldg(bg + 6 + j), pu = __ldg(bu + 6 + j);
-            const int qlg = in_block < 16 ? (pg & 0xF) : (pg >> 4);
-            const int qlu = in_block < 16 ? (pu & 0xF) : (pu >> 4);
-            const int qhg = (__ldg(bg + 2 + (in_block >> 3)) >> (in_block & 7)) & 1;
-            const int qhu = (__ldg(bu + 2 + (in_block >> 3)) >> (in_block & 7)) & 1;
+            const int qlg = low_nibble ? (pg & 0xF) : (pg >> 4);
+            const int qlu = low_nibble ? (pu & 0xF) : (pu >> 4);
+            const int qhg = (__ldg(bg + 2 + qh_byte) >> qh_shift) & 1;
+            const int qhu = (__ldg(bu + 2 + qh_byte) >> qh_shift) & 1;
             const float dg = half_bits_to_float((uint16_t) (__ldg(bg) | (__ldg(bg + 1) << 8)));
             const float du = half_bits_to_float((uint16_t) (__ldg(bu) | (__ldg(bu + 1) << 8)));
             const float xv = xs[xp(i)];
