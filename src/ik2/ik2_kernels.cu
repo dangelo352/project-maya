@@ -3162,6 +3162,17 @@ __device__ float row_dot(int type, const uint8_t* w, const float* xs, int K) {
             acc += iq3 ? iq3xxs_sub_dot(w + (size_t) (sb >> 3) * 98, sb & 7, xv)
                        : iq4xs_sub_dot(w + (size_t) (sb >> 3) * 136, sb & 7, xv);
         }
+    } else if (type == kQ5_0) {
+        for (int i = lane; i < K; i += 32) {
+            const uint8_t* b = w + (size_t) (i / 32) * 22;
+            const int in_block = i & 31;
+            const int j = in_block & 15;
+            const uint8_t packed = __ldg(b + 6 + j);
+            const int ql = in_block < 16 ? (packed & 0xF) : (packed >> 4);
+            const int qh = (__ldg(b + 2 + (in_block >> 3)) >> (in_block & 7)) & 1;
+            const float d = half_bits_to_float((uint16_t) (__ldg(b) | (__ldg(b + 1) << 8)));
+            acc += (d * (float) ((ql | (qh << 4)) - 16)) * xs[xp(i)];
+        }
     } else {
         for (int i = lane; i < K; i += 32) acc += decode_value(type, w, (size_t) i) * xs[xp(i)];
     }
@@ -3336,6 +3347,57 @@ __device__ void row_dot_2(int type, const uint8_t* wg, const uint8_t* wu, const 
             const size_t off = (size_t) (sb >> 3) * bb;
             ag += iq3 ? iq3xxs_sub_dot(wg + off, sb & 7, xv) : iq4xs_sub_dot(wg + off, sb & 7, xv);
             au += iq3 ? iq3xxs_sub_dot(wu + off, sb & 7, xv) : iq4xs_sub_dot(wu + off, sb & 7, xv);
+        }
+    } else if (type == kQ5_0) {
+        for (int i = lane; i < K; i += 32) {
+            const int in_block = i & 31;
+            const int j = in_block & 15;
+            const uint8_t* bg = wg + (size_t) (i / 32) * 22;
+            const uint8_t* bu = wu + (size_t) (i / 32) * 22;
+            const uint8_t pg = __ldg(bg + 6 + j), pu = __ldg(bu + 6 + j);
+            const int qlg = in_block < 16 ? (pg & 0xF) : (pg >> 4);
+            const int qlu = in_block < 16 ? (pu & 0xF) : (pu >> 4);
+            const int qhg = (__ldg(bg + 2 + (in_block >> 3)) >> (in_block & 7)) & 1;
+            const int qhu = (__ldg(bu + 2 + (in_block >> 3)) >> (in_block & 7)) & 1;
+            const float dg = half_bits_to_float((uint16_t) (__ldg(bg) | (__ldg(bg + 1) << 8)));
+            const float du = half_bits_to_float((uint16_t) (__ldg(bu) | (__ldg(bu + 1) << 8)));
+            const float xv = xs[xp(i)];
+            ag += (dg * (float) ((qlg | (qhg << 4)) - 16)) * xv;
+            au += (du * (float) ((qlu | (qhu << 4)) - 16)) * xv;
+        }
+    } else if (type == kQ4_K) {
+        for (int i = lane; i < K; i += 32) {
+            const int bi = i / 256;
+            const int in_block = i % 256;
+            const int is = in_block / 32, j = in_block % 32;
+            const uint8_t* bg = wg + (size_t) bi * 144;
+            const uint8_t* bu = wu + (size_t) bi * 144;
+            const uint8_t* qg = bg + 4;
+            const uint8_t* qu = bu + 4;
+            int scg, mg, scu, mu;
+            if (is < 4) {
+                scg = __ldg(qg + is) & 63;
+                mg = __ldg(qg + is + 4) & 63;
+                scu = __ldg(qu + is) & 63;
+                mu = __ldg(qu + is + 4) & 63;
+            } else {
+                const uint8_t qgh = __ldg(qg + is + 4), quh = __ldg(qu + is + 4);
+                scg = (qgh & 0xF) | ((__ldg(qg + is - 4) >> 6) << 4);
+                mg = (qgh >> 4) | ((__ldg(qg + is) >> 6) << 4);
+                scu = (quh & 0xF) | ((__ldg(qu + is - 4) >> 6) << 4);
+                mu = (quh >> 4) | ((__ldg(qu + is) >> 6) << 4);
+            }
+            const uint8_t qvg = __ldg(bg + 16 + (is / 2) * 32 + j);
+            const uint8_t qvu = __ldg(bu + 16 + (is / 2) * 32 + j);
+            const int qig = (is & 1) ? (qvg >> 4) : (qvg & 0xF);
+            const int qiu = (is & 1) ? (qvu >> 4) : (qvu & 0xF);
+            const float dg = half_bits_to_float((uint16_t) (__ldg(bg) | (__ldg(bg + 1) << 8)));
+            const float mng = half_bits_to_float((uint16_t) (__ldg(bg + 2) | (__ldg(bg + 3) << 8)));
+            const float du = half_bits_to_float((uint16_t) (__ldg(bu) | (__ldg(bu + 1) << 8)));
+            const float mnu = half_bits_to_float((uint16_t) (__ldg(bu + 2) | (__ldg(bu + 3) << 8)));
+            const float xv = xs[xp(i)];
+            ag += ((dg * (float) scg) * (float) qig - (mng * (float) mg)) * xv;
+            au += ((du * (float) scu) * (float) qiu - (mnu * (float) mu)) * xv;
         }
     } else {
         for (int i = lane; i < K; i += 32) {
