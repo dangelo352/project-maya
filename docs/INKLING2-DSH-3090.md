@@ -4,8 +4,9 @@ This documents the local Windows serving setup tested on the 24 GB RTX 3090. May
 
 ## Tested configuration
 
-- GGUF: Unsloth `Inkling-2-Mini-UD-Q4_K_XL.gguf` with Thinking Machines `mtp.safetensors`.
-- Engine: this repository's `maya-ik2.exe`, CUDA 12.8, sm_86; MTP width 8; FP8 KV.
+- GGUF: Unsloth `Inkling-2-Mini-UD-Q4_K_XL.gguf` with Maya's pinned Q8_0 DSpark drafter GGUF.
+- Engine: this repository's `maya-ik2.exe`, CUDA 12.8, sm_86; adaptive MTP width up to 8; FP8 target and drafter KV.
+- Drafter lookback: 65,536 tokens. A 100K prompt A/B favored this over 32K and full 200K drafter lookback.
 - Server: `serve/server.py`, bound to `127.0.0.1:18022`.
 - Context: 200,704 tokens. Input, image tokens, and generated output share this limit.
 - Images: `maya-vision` with the model's BF16 mmproj; the encoder runs on CPU so it does not take VRAM from the model.
@@ -18,7 +19,7 @@ The 200K setting is the high-context point tested with all experts and the draft
 Build `maya-ik2` using the Windows CUDA instructions in [INKLING2.md](INKLING2.md). Download these files into `models/` from the official repositories:
 
 - `Inkling-2-Mini-UD-Q4_K_XL.gguf` and `mmproj-BF16.gguf` from [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)
-- `mtp.safetensors` from [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+- `dspark-Inkling-2-Mini-Q8_0.gguf` from [Maya's pinned drafter release](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF/tree/37027719327de5f574684b525ad88fe50c4ff222/drafter). The project setup script fetches this Q8_0 format by default; it is the fastest supported drafter path in the engine.
 
 Write and validate the tokenizer:
 
@@ -90,7 +91,10 @@ checks are in [`tools/smoke_maya_openai.py`](../tools/smoke_maya_openai.py):
 - A 20,737-token prompt completed in 21.33 s without truncation and returned the requested `ORANGE` marker. Prefill measured 975.8 tok/s. Its five-token answer is too short to represent sustained decode speed.
 - Under concurrent GPU use, a 92,037-token prompt completed in 94.15 s and returned the requested `ORANGE` marker; prefill measured 978.7 tok/s. This checks a substantially longer prompt, not a full 200,704-token fill.
 - In that same loaded run, the coding answer generated at 193.2 tok/s with MTP accepting 153 of 180 proposed draft tokens. The forced tool call and image recognition also passed (0.98 s image response).
+- Swapping the old BF16 safetensors drafter and 8K drafter lookback for the pinned Q8_0 GGUF, FP8 drafter cache, and 65K lookback improved the same short coding API check to **231.5 tok/s** (214 generated tokens; 166/252 draft tokens accepted). The old path measured 193.2 tok/s on that same check.
+- For a controlled 100,076-token repeated prompt with a 512-token coding output cap, the new configuration measured **147.9 tok/s** (331/504 drafts accepted). The BF16/8K setup measured 136.5 tok/s; Q8/FP8 at 32K measured 146.8, and at full 200K drafter lookback measured 139.8. These one-run results identify 65K as the best tested setting, not a universal benchmark.
+- On the final configuration, the full API smoke run identified the generated image as a blue square, returned the exact forced calculator arguments, generated the 214-token coding answer at 231.5 tok/s, and processed a 92,037-token prompt in 86.69 s (1,063.4 tok/s prefill) with the requested `ORANGE` answer. The 5-token response speed is not a sustained decode measurement.
 
-The current PC's DSH desktop profile points to this loopback server, defaults new sessions to Maya, declares text and image input, and routes auto-compaction through Maya. Existing Qwen provider settings remain available. The endpoint handled a 92,037-token prompt; a single prompt filling all 200,704 tokens and an entire long-running DSH compaction cycle were not exercised in this smoke run.
+Speculative decoding verifies candidate windows against the main model, so the drafter changes proposal speed rather than the main model's accepted output distribution. The current PC's DSH desktop profile points to this loopback server, defaults new sessions to Maya, declares text and image input, and routes auto-compaction through Maya. Existing Qwen provider settings remain available. The endpoint handled a 92,037-token prompt; a single prompt filling all 200,704 tokens and an entire long-running DSH compaction cycle were not exercised in this smoke run.
 
 Re-run the manual API checks with `python tools/smoke_maya_openai.py --base-url http://127.0.0.1:18022`.
