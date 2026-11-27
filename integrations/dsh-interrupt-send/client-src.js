@@ -43,13 +43,23 @@ function buttonStyle() {
   }
 }
 
-export async function promoteQueuedMessage(face, itemId, interrupt = false) {
+export async function requestStepOverride(sessionId, identity, fetchImpl = fetch) {
+  const response = await fetchImpl('/api/dsh-step-override', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({sessionId, ...identity}),
+  })
+  const result = await response.json()
+  if (!response.ok || !result.accepted) throw new Error(result.error || 'Step override was not accepted.')
+  return result
+}
+
+export async function promoteQueuedMessage(face, itemId, interrupt = false, stepOverride) {
+  if (interrupt) {
+    if (!stepOverride) throw new Error('Step override service unavailable; nothing was stopped.')
+    return stepOverride(itemId)
+  }
   const result = await face.updateQueue(itemId, { kind: 'steer' })
   if (!result?.ok) throw new Error(result?.error?.message || 'The queued message could not be steered.')
-  if (interrupt) {
-    const stopped = await face.cancel()
-    if (!stopped?.ok) throw new Error(stopped?.error?.message || 'Message was steered, but DSH could not stop the current step.')
-  }
 }
 
 export function mount(React, slots, remoteSession, sessions) {
@@ -130,27 +140,25 @@ export function mount(React, slots, remoteSession, sessions) {
         if (!face) throw new Error('The selected session is no longer available.')
         const plainText = canSteer
         const text = inputRef.current?.draft?.trim()
-        if (face.getSnapshot().running) {
-          const result = await face.cancel()
-          if (!result?.ok) throw new Error(result?.error?.message || 'DSH refused to stop the turn.')
-        }
         if (plainText && text) {
           // Enqueue through the native steer inbox after cancellation acceptance.
           // Waiting for a stable idle interval races auto-continuing goals.
           const submission = face.beginSubmission({ mode: 'steer', text, attachments: [] })
           const result = await face.prompt([{ type: 'text', text }], 'steer', undefined, submission.requestId)
           if (!result?.ok) throw new Error(result?.error?.message || 'DSH refused the new message.')
+          let deliveryNotice = 'Message delivered.'
+          if (face.getSnapshot().running) {
+            try { await requestStepOverride(sessionId, {requestId:submission.requestId}); deliveryNotice = 'Step overridden - goal continues.' }
+            catch (error) { deliveryNotice = `Message sent; step override unavailable: ${error.message}` }
+          }
           if (sessionRef.current?.sessionId === sessionId && inputRef.current?.draft?.trim() === text) {
             actionsRef.current.setDraft('')
             actionsRef.current.persistDraft()
           }
-          setNotice('Override accepted - stop requested and message delivered.')
+          setNotice(deliveryNotice)
         } else {
-          await waitForIdle(() => face.getSnapshot(), sessionId)
-          if (sessionRef.current?.sessionId !== sessionId) throw new Error('The selected session changed. Your draft is saved.')
-          if (!hasDraft(inputRef.current)) throw new Error('The draft changed before sending.')
-          actionsRef.current.submit()
-          setNotice('Turn stopped - draft submitted.')
+          throw new Error('Step override currently requires a plain-text draft. Use queued Send now to preserve attached messages.')
+
         }
       } catch (error) {
         setNotice(error?.message || 'Override failed; your draft remains in the composer.')
@@ -203,8 +211,8 @@ export function mount(React, slots, remoteSession, sessions) {
       setNotice('')
       try {
         if (kind === 'steer' || kind === 'override') {
-          await promoteQueuedMessage(face, row.id, kind === 'override')
-          setNotice(kind === 'override' ? 'Queued message sent now; current step stopped.' : 'Queued message will be read after the current step.')
+          await promoteQueuedMessage(face, row.id, kind === 'override', itemId => requestStepOverride(sessionId, {itemId}))
+          setNotice(kind === 'override' ? 'Current step overridden; goal continues.' : 'Queued message will be read after the current step.')
         } else {
           const result = await face.updateQueue(row.id, kind === 'edit'
             ? { kind: 'edit', content: [{ type: 'text', text: content }] }

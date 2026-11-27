@@ -43,32 +43,6 @@ module.exports = __toCommonJS(client_entry_exports);
 var import_react = __toESM(require("react"), 1);
 
 // client-src.js
-var WAIT_POLL_MS = 100;
-var IDLE_STABLE_MS = 250;
-var CANCEL_TIMEOUT_MS = 12e4;
-async function waitForIdle(readSession, sessionId, options = {}) {
-  const pollMs = options.pollMs ?? WAIT_POLL_MS;
-  const stableMs = options.stableMs ?? IDLE_STABLE_MS;
-  const timeoutMs = options.timeoutMs ?? CANCEL_TIMEOUT_MS;
-  const now = options.now ?? Date.now;
-  const sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const started = now();
-  let idleSince;
-  while (now() - started <= timeoutMs) {
-    const session = readSession();
-    if (!session || session.sessionId !== sessionId || session.removed) {
-      throw new Error("The selected session changed while stopping; your draft is still saved.");
-    }
-    if (!session.running) {
-      idleSince ??= now();
-      if (now() - idleSince >= stableMs) return;
-    } else {
-      idleSince = void 0;
-    }
-    await sleep(pollMs);
-  }
-  throw new Error("DSH has not reached idle yet. Your draft is still in the composer; try again after the current tool finishes.");
-}
 function hasDraft(input) {
   return Boolean(input && (input.draft?.trim() || input.attachmentIds?.length));
 }
@@ -93,13 +67,23 @@ function buttonStyle() {
     transition: "background-color 100ms ease"
   };
 }
-async function promoteQueuedMessage(face, itemId, interrupt = false) {
+async function requestStepOverride(sessionId, identity, fetchImpl = fetch) {
+  const response = await fetchImpl("/api/dsh-step-override", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sessionId, ...identity })
+  });
+  const result = await response.json();
+  if (!response.ok || !result.accepted) throw new Error(result.error || "Step override was not accepted.");
+  return result;
+}
+async function promoteQueuedMessage(face, itemId, interrupt = false, stepOverride) {
+  if (interrupt) {
+    if (!stepOverride) throw new Error("Step override service unavailable; nothing was stopped.");
+    return stepOverride(itemId);
+  }
   const result = await face.updateQueue(itemId, { kind: "steer" });
   if (!result?.ok) throw new Error(result?.error?.message || "The queued message could not be steered.");
-  if (interrupt) {
-    const stopped = await face.cancel();
-    if (!stopped?.ok) throw new Error(stopped?.error?.message || "Message was steered, but DSH could not stop the current step.");
-  }
 }
 function mount(React2, slots, remoteSession, sessions) {
   const h = React2.createElement;
@@ -169,25 +153,26 @@ function mount(React2, slots, remoteSession, sessions) {
         if (!face) throw new Error("The selected session is no longer available.");
         const plainText = canSteer;
         const text = inputRef.current?.draft?.trim();
-        if (face.getSnapshot().running) {
-          const result = await face.cancel();
-          if (!result?.ok) throw new Error(result?.error?.message || "DSH refused to stop the turn.");
-        }
         if (plainText && text) {
           const submission = face.beginSubmission({ mode: "steer", text, attachments: [] });
           const result = await face.prompt([{ type: "text", text }], "steer", void 0, submission.requestId);
           if (!result?.ok) throw new Error(result?.error?.message || "DSH refused the new message.");
+          let deliveryNotice = "Message delivered.";
+          if (face.getSnapshot().running) {
+            try {
+              await requestStepOverride(sessionId, { requestId: submission.requestId });
+              deliveryNotice = "Step overridden - goal continues.";
+            } catch (error) {
+              deliveryNotice = `Message sent; step override unavailable: ${error.message}`;
+            }
+          }
           if (sessionRef.current?.sessionId === sessionId && inputRef.current?.draft?.trim() === text) {
             actionsRef.current.setDraft("");
             actionsRef.current.persistDraft();
           }
-          setNotice("Override accepted - stop requested and message delivered.");
+          setNotice(deliveryNotice);
         } else {
-          await waitForIdle(() => face.getSnapshot(), sessionId);
-          if (sessionRef.current?.sessionId !== sessionId) throw new Error("The selected session changed. Your draft is saved.");
-          if (!hasDraft(inputRef.current)) throw new Error("The draft changed before sending.");
-          actionsRef.current.submit();
-          setNotice("Turn stopped - draft submitted.");
+          throw new Error("Step override currently requires a plain-text draft. Use queued Send now to preserve attached messages.");
         }
       } catch (error) {
         setNotice(error?.message || "Override failed; your draft remains in the composer.");
@@ -247,8 +232,8 @@ function mount(React2, slots, remoteSession, sessions) {
       setNotice("");
       try {
         if (kind === "steer" || kind === "override") {
-          await promoteQueuedMessage(face, row.id, kind === "override");
-          setNotice(kind === "override" ? "Queued message sent now; current step stopped." : "Queued message will be read after the current step.");
+          await promoteQueuedMessage(face, row.id, kind === "override", (itemId) => requestStepOverride(sessionId, { itemId }));
+          setNotice(kind === "override" ? "Current step overridden; goal continues." : "Queued message will be read after the current step.");
         } else {
           const result = await face.updateQueue(row.id, kind === "edit" ? { kind: "edit", content: [{ type: "text", text: content }] } : { kind: "remove" });
           if (!result?.ok) throw new Error(result?.error?.message || "Queue update failed.");

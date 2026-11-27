@@ -1,81 +1,57 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mount } from '../client-src.js'
+import { overrideStep } from '../step-override.js'
+import { promoteQueuedMessage, requestStepOverride } from '../client-src.js'
 
-function setup(running, refuseCancel = false) {
-  const snapshot = {sessionId: 'button-check', running}
-  const input = {draft: 'LATEST_MESSAGE', phase: 'plain', attachmentIds: [], occurrences: []}
-  const calls = []
-  const face = {
-    getSnapshot: () => snapshot,
-    cancel: async () => { calls.push('cancel'); return refuseCancel ? {ok:false,error:{message:'cancel refused'}} : {ok:true} },
-    beginSubmission: data => { calls.push(['echo',data.mode]); return {requestId:'one'} },
-    prompt: async (parts, mode) => { calls.push(['prompt',parts[0].text,mode]); return {ok:true,value:{accepted:true}} },
+function fixture() {
+  const message={id:'queued-one',source:{kind:'user',rpcId:'receipt-one'},content:[{type:'text',text:'Latest direction'},{type:'image',attachment:{attachmentId:'image-one'}}]}
+  const goal={id:'goal-one',revision:7,phase:'active',activation:'armed',roundsStarted:12,maxGoalRounds:256}
+  const oldAttemptRevision=goal.revision
+  const calls=[]
+  const agent={status:'running',inbox:{nextTurn:[message],nextStep:[],remove(id){calls.push('remove');this.nextTurn=this.nextTurn.filter(x=>x.id!==id);this.nextStep=this.nextStep.filter(x=>x.id!==id)}},
+    cancel(cause,options){calls.push(['cancel',cause,options]);if(goal.revision===oldAttemptRevision)goal.phase='paused';this.aborted=true},
+    steer(item){calls.push('wake');assert.equal(this.aborted,true);this.delivered=item},
   }
-  const actions = {
-    persistDraft: () => {}, submit: () => {calls.push('submit')},
-    setDraft: text => { input.draft=text;calls.push(['draft',text]) },
-  }
-  const React = {
-    createElement: (type, props, ...children) => ({type,props,children}),
-    useState: value => [value, () => {}], useRef: current => ({current}),
-  }
-  let Component
-  mount(React, {inject:(_,f)=>f(),register:(_,c)=>{Component=c}}, {cancel:()=>face.cancel()}, {binding:()=>({session:face})})
-  const tree=Component({useSession:f=>f(snapshot),useInput:f=>f(input),inputActions:actions})
-  const buttons=tree.children.filter(x=>x?.type==='button')
-  return {calls,input,steer:buttons[0],override:buttons[1]}
+  const ctx={agents:{get:()=>agent},goals:{get:()=>({...goal}),disarm:()=>{goal.activation='disarmed'},resume:(_,ref)=>{assert.equal(ref.revision,goal.revision);goal.revision++;goal.phase='active';goal.activation='armed'}}}
+  ctx.get = name => name === 'goals' ? ctx.goals : undefined
+  return {ctx,agent,goal,message,calls}
 }
+test('queued Override preserves goal, round count, message identity and attachments, then wakes',()=>{
+  const s=fixture()
+  const result=overrideStep(s.ctx,{sessionId:'session-one',itemId:'queued-one'})
+  assert.equal(result.accepted,true)
+  assert.equal(s.agent.delivered,s.message)
+  assert.equal(s.goal.phase,'active')
+  assert.equal(s.goal.activation,'armed')
+  assert.equal(s.goal.roundsStarted,12)
+  assert.deepEqual(s.calls,['remove',['cancel',{kind:'hook',reason:'user-step-override'},{keepInbox:true}],'wake'])
+})
+test('composer Override locates an already admitted message by request receipt',()=>{
+  const s=fixture()
+  overrideStep(s.ctx,{sessionId:'session-one',requestId:'receipt-one'})
+  assert.equal(s.agent.delivered,s.message)
+})
+test('already consumed queued item cannot stop unrelated work or alter the goal',()=>{
+  const s=fixture()
+  assert.throws(()=>overrideStep(s.ctx,{sessionId:'session-one',itemId:'missing'}),/already been consumed/)
+  assert.deepEqual(s.calls,[])
+  assert.equal(s.goal.revision,7)
+})
+test('Send now uses the host step override and never user-cancels the goal',async()=>{
+  await promoteQueuedMessage({cancel:()=>assert.fail('user cancel is forbidden')},'queued-one',true,async id=>assert.equal(id,'queued-one'))
+})
+test('regular queued Steer remains a normal inbox promotion',async()=>{
+  await promoteQueuedMessage({updateQueue:async(id,action)=>{assert.equal(id,'queued-one');assert.deepEqual(action,{kind:'steer'});return{ok:true}}},'queued-one')
+})
+test('missing override service fails safely and does not stop the goal',async()=>{
+  await assert.rejects(requestStepOverride('session-one',{itemId:'queued-one'},async()=>({ok:false,json:async()=>({error:'service not loaded'})})),/service not loaded/)
+})
 
-test('steer sends once and clears the draft only after host acceptance', async()=>{
-  const s=setup(true)
-  assert.equal(s.steer.props.disabled,false)
-  await Promise.all([s.steer.props.onClick(),s.steer.props.onClick()])
-  assert.equal(s.calls.filter(x=>Array.isArray(x)&&x[0]==='prompt').length,1)
-  assert.deepEqual(s.calls.find(x=>Array.isArray(x)&&x[0]==='prompt'),['prompt','LATEST_MESSAGE','steer'])
-  assert.equal(s.input.draft,'')
-})
-test('override delivers after cancellation even if an auto-goal never stays idle', async()=>{
-  const s=setup(true)
-  await s.override.props.onClick()
-  assert.equal(s.calls[0],'cancel')
-  assert.deepEqual(s.calls.find(x=>Array.isArray(x)&&x[0]==='prompt'),['prompt','LATEST_MESSAGE','steer'])
-  assert.equal(s.input.draft,'')
-})
-test('failed turn permits both buttons and refused cancellation retains the draft',async()=>{
-  const idle=setup(false)
-  assert.equal(idle.override.props.disabled,false)
-  assert.equal(idle.steer.props.disabled,false)
-  await idle.override.props.onClick()
-  assert.equal(idle.calls.includes('cancel'),false)
-  const denied=setup(true,true)
-  await denied.override.props.onClick()
-  assert.equal(denied.input.draft,'LATEST_MESSAGE')
-  assert.equal(denied.calls.some(x=>Array.isArray(x)&&x[0]==='prompt'),false)
-})
-
-import { promoteQueuedMessage } from '../client-src.js'
-
-test('queued steer promotes the existing message ID without copying attachments', async()=>{
-  const calls=[]
-  await promoteQueuedMessage({
-    updateQueue: async(id,action)=>{calls.push([id,action]);return {ok:true}},
-    cancel: async()=>{throw new Error('steer must not cancel')},
-    prompt: async()=>{throw new Error('queued messages must never be resent')},
-  },'queued-attachment-message')
-  assert.deepEqual(calls,[['queued-attachment-message',{kind:'steer'}]])
-})
-test('queued Send now promotes the existing item then requests stop',async()=>{
-  const calls=[]
-  await promoteQueuedMessage({
-    updateQueue:async(id,action)=>{calls.push(['promote',id,action.kind]);return {ok:true}},
-    cancel:async()=>{calls.push(['cancel']);return {ok:true}},
-  },'queued-two',true)
-  assert.deepEqual(calls,[['promote','queued-two','steer'],['cancel']])
-})
-test('a queue item already consumed cannot cancel unrelated work',async()=>{
-  await assert.rejects(promoteQueuedMessage({
-    updateQueue:async()=>({ok:false,error:{message:'item no longer pending'}}),
-    cancel:async()=>{throw new Error('must not cancel when promotion fails')},
-  },'old-item',true),/no longer pending/)
+test('Cordis goal service is resolved without undeclared property access',()=>{
+  const s=fixture()
+  const goals=s.ctx.goals
+  s.ctx.get=name=>name==='goals'?goals:undefined
+  Object.defineProperty(s.ctx,'goals',{get(){throw new Error('cannot get property goals without inject')}})
+  assert.equal(overrideStep(s.ctx,{sessionId:'session-one',itemId:'queued-one'}).accepted,true)
+  assert.equal(s.goal.phase,'active')
 })
