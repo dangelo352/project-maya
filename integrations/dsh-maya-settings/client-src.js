@@ -20,6 +20,7 @@ export function readMayaValues(llmView, compactionView) {
     context: Number(model.contextWindow),
     maxTokens: Number(model.maxTokens),
     modelName: model.name ?? model.id,
+    configuredInput: Array.isArray(model.input) ? model.input : ['text'],
     reasoningEfforts: {
       low: model.reasoningEfforts?.low ?? 'low',
       medium: model.reasoningEfforts?.medium ?? 'medium',
@@ -123,7 +124,7 @@ function MayaSettings({ load, describe, update, fetchImpl }) {
     const values = readMayaValues(data.llm, null)
     if (Number.isSafeInteger(data.server?.context)) values.context = data.server.context
     setState({
-      status: 'ready', error: '', message, server: data.server, llm: data.llm,
+      status: 'ready', error: '', message, server: data.server ?? { status: 'unreported' }, llm: data.llm,
       compactionView: data.qwen, defaultPreset: data.defaultPreset,
       draft: values, compactDraft: readPresetCompactionValues(data.qwen), busy: '',
     })
@@ -253,7 +254,9 @@ function MayaSettings({ load, describe, update, fetchImpl }) {
   const serverOnline = server.status === 'ok'
   const serverLabel = serverOnline
     ? (server.unloaded ? '· model unloaded' : '· ready')
-    : server.status === 'offline' ? '· offline' : '· status not reported by this DSH bridge yet'
+    : server.status === 'offline' ? '· offline' : '· live health appears after DSH reload'
+  const configuredImages = d.configuredInput.includes('image')
+  const imagesAvailable = typeof server.images === 'boolean' ? server.images : configuredImages
   const qwenPresetActive = state.defaultPreset === 'qwen38'
   const compactWindow = Number(d.context)
   const output = Number(d.maxTokens)
@@ -272,7 +275,7 @@ function MayaSettings({ load, describe, update, fetchImpl }) {
         React.createElement('p', null, `Model: ${server.model ?? d.modelName}`),
         React.createElement('p', null, `Maya version: ${server.version ?? 'unavailable'}`),
         React.createElement('p', null, `Loaded context: ${Number(server.maxContext ?? d.context).toLocaleString()} tokens`),
-        React.createElement('p', null, `Input: ${server.images ? 'text + images' : 'text only'}${server.videos ? ' + video' : ''}`)),
+        React.createElement('p', null, `Configured input: ${d.configuredInput.join(' + ')}${imagesAvailable && !d.configuredInput.includes('image') ? ' (server image support)' : ''}${server.videos ? ' + video' : ''}`)),
       React.createElement('p', { style: { opacity: 0.72 } }, 'Endpoint: http://127.0.0.1:18022/v1 · the backend gate keeps this route on the local Maya server.'),
     ),
     React.createElement('section', { style: cardStyle },

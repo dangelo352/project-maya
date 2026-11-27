@@ -45,12 +45,13 @@ test('context bridge rejects cross-origin writes and invalid sizes', async () =>
 })
 
 test('Maya settings helpers preserve unrelated provider and compaction rows', () => {
-  const llm = { revision: 1, value: { providers: { 'maya-local': { reasoning: 'high', models: [{ id: 'inkling-2-mini', contextWindow: 200704, maxTokens: 32768, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high' } }, { id: 'other', maxTokens: 10 }] }, other: { keep: true } } } }
+  const llm = { revision: 1, value: { providers: { 'maya-local': { reasoning: 'high', models: [{ id: 'inkling-2-mini', contextWindow: 200704, maxTokens: 32768, input: ['text', 'image'], reasoningEfforts: { low: 'low', medium: 'medium', high: 'high' } }, { id: 'other', maxTokens: 10 }] }, other: { keep: true } } } }
   const compaction = { revision: 2, value: { modelPolicies: [{ provider: 'maya-local', model: 'inkling-2-mini', thresholdRatio: 0.65, maxTokens: 4096 }, { provider: 'other', model: 'other', thresholdRatio: 0.7 }] } }
   const values = readMayaValues(llm, compaction)
   assert.equal(values.context, 200704)
   assert.equal(values.maxTokens, 32768)
   assert.equal(values.reasoning, 'high')
+  assert.deepEqual(values.configuredInput, ['text', 'image'])
   assert.deepEqual(values.reasoningEfforts, { low: 'low', medium: 'medium', high: 'high' })
   assert.equal(values.compactPct, 65)
   assert.equal(readMayaValues(llm, null).compactPct, null)
