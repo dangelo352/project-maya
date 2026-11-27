@@ -4,7 +4,7 @@ This documents the local Windows serving setup tested on the 24 GB RTX 3090. May
 
 ## Tested configuration
 
-- GGUF: Unsloth `Inkling-2-Mini-UD-Q4_K_XL.gguf` with Maya's pinned Q8_0 DSpark drafter GGUF.
+- GGUF: mrfakename's refusal-ablated Unsloth-layout `Inkling-2-Mini-abliterated-UD-Q4_K_XL.gguf` with Maya's pinned Q8_0 DSpark drafter GGUF. The original Unsloth checkpoint remains available as a rollback.
 - Engine: this repository's `maya-ik2.exe`, CUDA 12.8, sm_86; adaptive MTP width up to 8; FP8 target and drafter KV.
 - Drafter lookback: 65,536 tokens. A 100K prompt A/B favored this over 32K and full 200K drafter lookback.
 - Server: `serve/server.py`, bound to `127.0.0.1:18022`.
@@ -96,5 +96,19 @@ checks are in [`tools/smoke_maya_openai.py`](../tools/smoke_maya_openai.py):
 - On the final configuration, the full API smoke run identified the generated image as a blue square, returned the exact forced calculator arguments, generated the 214-token coding answer at 231.5 tok/s, and processed a 92,037-token prompt in 86.69 s (1,063.4 tok/s prefill) with the requested `ORANGE` answer. The 5-token response speed is not a sustained decode measurement.
 
 Speculative decoding verifies candidate windows against the main model, so the drafter changes proposal speed rather than the main model's accepted output distribution. The current PC's DSH desktop profile points to this loopback server, defaults new sessions to Maya, declares text and image input, and routes auto-compaction through Maya. Existing Qwen provider settings remain available. The endpoint handled a 92,037-token prompt; a single prompt filling all 200,704 tokens and an entire long-running DSH compaction cycle were not exercised in this smoke run.
+
+## Refusal-ablated checkpoint (2026-11-26)
+
+The active runtime config uses `E:/Project-Maya-fastpath-reference/models/Inkling-2-Mini-abliterated-UD-Q4_K_XL.gguf`. It is the Unsloth-layout UD-Q4_K_XL quant from [mrfakename's abliterated GGUF repo](https://huggingface.co/mrfakename/Inkling-2-Mini-abliterated-GGUF), stored beside the original model. SHA-256: `9dc4e98e7724b9e071a627680105ff75df63ef5851093bf32180334be5027805`. It keeps the NVFP4 expert layout Maya expects and changes only the tensors used by the directional refusal edit. The BF16 mmproj, Q8 DSpark drafter, FP8 caches, 65,536-token drafter lookback, 200,704-token context, model ID, and DSH endpoint are unchanged. DSH therefore continues using the same provider URL and tool, image, and compaction routes.
+
+The model card's published Q8_0 evaluation reports 1/100 refusals in chat and 0/100 in thinking mode. Those numbers are for its Q8_0 evaluation, not a local refusal benchmark of this UD-Q4_K_XL file. The repo reports that this UD-Q4_K_XL quant retains 98.5% of the measured ablation edit after re-quantization. No checkpoint can promise zero refusals for every possible prompt.
+
+Local checks on the active 3090 server:
+
+- A 214-token Python coding response completed at 236.0 tok/s with 165/230 draft tokens accepted. The previous base-model sample on the same short coding task was 231.5 tok/s; both are single samples and indicate comparable speed, not a guaranteed average.
+- The forced calculator tool call returned `calculator({"a":19,"b":23})` and the vision endpoint identified a generated blue square. `/health` reported 200,704 context and image support.
+- Four harmless direct-answer prompts produced no refusal. With reasoning set to medium and an artificial 256-token output cap, some short answers ended at the cap or had no final text; increasing the cap to 1,024 returned complete answers. DSH's configured output allowance is much higher, but short custom output caps can truncate this checkpoint's reasoning.
+
+The previous runtime config is preserved at `build/maya-dsh-200k.json.before-abliterated-20261126`. The model weights and runtime config are machine-local and are not committed to Git.
 
 Re-run the manual API checks with `python tools/smoke_maya_openai.py --base-url http://127.0.0.1:18022`.
