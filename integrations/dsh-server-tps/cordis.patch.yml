@@ -1,0 +1,4 @@
+# Register the Host service. Its browser half is published by the package's DSH client metadata.
+- insert:
+    - id: dsh-server-tps
+      name: '@maya/dsh-server-tps'
