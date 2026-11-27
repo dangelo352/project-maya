@@ -8,6 +8,9 @@ export const BACKENDS = Object.freeze({
   'maya-local-compact': 'maya',
   'hyperqwen-local': 'qwen',
   'hyperqwen-local-compact': 'qwen',
+  // The Qwen QoL adapter registers this provider by default. Keep it behind
+  // the same single-GPU handoff as the profile's named HyperQwen routes.
+  qwen38: 'qwen',
 })
 
 export const BACKEND_URLS = Object.freeze({

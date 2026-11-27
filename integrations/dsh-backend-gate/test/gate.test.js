@@ -22,14 +22,25 @@ test('same selected backend is a no-op and aliases map exactly', async () => {
   const io = clients()
   const gate = new BackendGate({ clients: io })
   gate.currentBackend = 'qwen'
-  const release = await gate.acquire('hyperqwen-local-compact')
+  const release = await gate.acquire('qwen38')
   assert.equal(gate.activeRequests, 1)
   release()
   assert.deepEqual(io.calls, [])
   assert.deepEqual(BACKENDS, {
     'maya-local': 'maya', 'maya-local-compact': 'maya',
     'hyperqwen-local': 'qwen', 'hyperqwen-local-compact': 'qwen',
+    qwen38: 'qwen',
   })
+})
+
+test('default qwen38 route shares the same drain and unload gate', async () => {
+  const io = clients()
+  const gate = new BackendGate({ clients: io })
+  gate.currentBackend = 'maya'
+  const release = await gate.acquire('qwen38')
+  assert.deepEqual(io.calls, [['unload', 'maya']])
+  assert.equal(gate.currentBackend, 'qwen')
+  release()
 })
 
 test('same backend requests overlap without unloading', async () => {
