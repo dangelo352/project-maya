@@ -108,10 +108,10 @@ function mount(React2, slots, remoteSession, sessions) {
     inputRef.current = input;
     actionsRef.current = inputActions;
     const sessionId = session?.sessionId;
-    const canSubmit = Boolean(session?.running && sessionId && hasDraft(input) && ["plain", "claimed"].includes(input?.phase) && typeof inputActions?.persistDraft === "function" && typeof inputActions?.submit === "function");
+    const canSubmit = Boolean(sessionId && hasDraft(input) && ["plain", "claimed"].includes(input?.phase) && typeof inputActions?.persistDraft === "function" && typeof inputActions?.submit === "function");
     if (!sessionId) return null;
     const draft = input?.draft?.trim() || "";
-    const canSteer = canSubmit && Boolean(draft) && input?.attachmentIds?.length === 0 && input?.occurrences?.length === 0 && !input?.claim && !draft.startsWith("/") && typeof sessions?.binding === "function";
+    const canSteer = canSubmit && Boolean(draft) && (input?.attachmentIds?.length ?? 0) === 0 && (input?.occurrences?.length ?? 0) === 0 && !input?.claim && !draft.startsWith("/") && typeof sessions?.binding === "function";
     const steer = async () => {
       if (actionRef.current || !canSteer) return;
       actionRef.current = true;
@@ -120,7 +120,7 @@ function mount(React2, slots, remoteSession, sessions) {
       try {
         const before = sessionRef.current;
         const text = inputRef.current?.draft?.trim();
-        if (!before?.running || before.sessionId !== sessionId || !text) {
+        if (!before || before.sessionId !== sessionId || !text) {
           throw new Error("The active turn or draft changed. Nothing was sent.");
         }
         actionsRef.current.persistDraft();
@@ -157,21 +157,30 @@ function mount(React2, slots, remoteSession, sessions) {
       setNotice("Saving draft and stopping the active turn\u2026");
       try {
         actionsRef.current.persistDraft();
-        const result = await remoteSession.cancel({ sessionId });
-        if (result?.ok === false || result?.accepted === false) {
-          throw new Error(result.error?.message || result.message || "DSH did not accept the stop request.");
+        const face = sessions.binding(sessionId)?.session;
+        if (!face) throw new Error("The selected session is no longer available.");
+        const plainText = canSteer;
+        const text = inputRef.current?.draft?.trim();
+        if (face.getSnapshot().running) {
+          const result = await face.cancel();
+          if (!result?.ok) throw new Error(result?.error?.message || "DSH refused to stop the turn.");
         }
-        await waitForIdle(() => sessionRef.current, sessionId);
-        const latestSession = sessionRef.current;
-        const latestInput = inputRef.current;
-        if (latestSession?.sessionId !== sessionId || latestSession.running) {
-          throw new Error("The session started again before the draft could be sent. Your draft is still saved.");
+        if (plainText && text) {
+          const submission = face.beginSubmission({ mode: "steer", text, attachments: [] });
+          const result = await face.prompt([{ type: "text", text }], "steer", void 0, submission.requestId);
+          if (!result?.ok) throw new Error(result?.error?.message || "DSH refused the new message.");
+          if (sessionRef.current?.sessionId === sessionId && inputRef.current?.draft?.trim() === text) {
+            actionsRef.current.setDraft("");
+            actionsRef.current.persistDraft();
+          }
+          setNotice("Override accepted - stop requested and message delivered.");
+        } else {
+          await waitForIdle(() => face.getSnapshot(), sessionId);
+          if (sessionRef.current?.sessionId !== sessionId) throw new Error("The selected session changed. Your draft is saved.");
+          if (!hasDraft(inputRef.current)) throw new Error("The draft changed before sending.");
+          actionsRef.current.submit();
+          setNotice("Turn stopped - draft submitted.");
         }
-        if (!hasDraft(latestInput) || !["plain", "claimed"].includes(latestInput?.phase)) {
-          throw new Error("The composer changed while DSH was stopping. Your draft is still saved.");
-        }
-        actionsRef.current.submit();
-        setNotice("Previous turn stopped \xB7 latest draft sent as a new turn.");
       } catch (error) {
         setNotice(error?.message || "Override failed; your draft remains in the composer.");
       } finally {
@@ -189,7 +198,7 @@ function mount(React2, slots, remoteSession, sessions) {
         style: { display: "inline-flex", alignItems: "center", flex: "0 0 auto", gap: 2 }
       },
       h("style", null, `[data-dsh-busy-draft-actions] button:enabled{cursor:pointer}[data-dsh-busy-draft-actions] button:enabled:hover{background:var(--dsw-alias-interactive-bg-hover)}[data-dsh-busy-draft-actions] button:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}[data-dsh-busy-draft-actions] button:disabled{cursor:default;color:var(--dsw-alias-label-secondary)}@media(pointer:coarse){[data-dsh-busy-draft-actions] button{min-height:36px}}`),
-      notice ? h("span", { role: "status", "aria-live": "polite", style: { position: "absolute", width: 1, height: 1, overflow: "hidden", clipPath: "inset(50%)" } }, notice) : null,
+      notice ? h("span", { role: "status", "aria-live": "polite", title: notice, style: { maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11, color: "var(--dsw-alias-label-primary)" } }, notice) : null,
       h("button", {
         type: "button",
         onClick: steer,
