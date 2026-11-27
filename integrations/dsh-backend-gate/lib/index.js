@@ -54,6 +54,10 @@ function isConnectionError(error) {
   return error instanceof TypeError && /fetch failed|failed to fetch/i.test(error.message)
 }
 
+function isTransientHttpError(error) {
+  return error instanceof Error && /HTTP 5\d\d\b/.test(error.message)
+}
+
 async function startHyperInklingService({ distro, unit }) {
   if (process.platform !== 'win32') {
     throw new Error('automatic HyperInkling startup is configured for Windows + WSL only')
@@ -89,7 +93,7 @@ export function createBackendClients({
       try {
         return await hyperinklingSleeping()
       } catch (error) {
-        if (!isConnectionError(error)) throw error
+        if (!isConnectionError(error) && !isTransientHttpError(error)) throw error
         lastError = error
       }
       await new Promise(resolve => setTimeout(resolve, pollIntervalMs))
@@ -122,8 +126,11 @@ export function createBackendClients({
       try {
         sleeping = await hyperinklingSleeping()
       } catch (error) {
-        if (!isConnectionError(error)) throw error
-        await startService({ distro, unit: serviceUnit })
+        if (isConnectionError(error)) {
+          await startService({ distro, unit: serviceUnit })
+        } else if (!isTransientHttpError(error)) {
+          throw error
+        }
         sleeping = await waitForHyperInkling()
       }
       if (sleeping) {

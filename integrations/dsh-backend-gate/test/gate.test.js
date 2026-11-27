@@ -157,11 +157,16 @@ test('offline HyperInkling is treated as idle during bootstrap', async () => {
 test('HyperInkling starts on demand and wakes when the API is ready', async () => {
   let started = false
   let sleeping = true
+  let warming = true
   const calls = []
   const fetchImpl = async (url, init = {}) => {
     calls.push([url, init.method ?? 'GET'])
     if (!started) throw new TypeError('fetch failed')
     if (url.endsWith('/is_sleeping')) {
+      if (warming) {
+        warming = false
+        return { ok: false, status: 503, json: async () => ({}) }
+      }
       return { ok: true, json: async () => ({ is_sleeping: sleeping }) }
     }
     if (url.endsWith('/wake_up')) {
@@ -182,7 +187,8 @@ test('HyperInkling starts on demand and wakes when the API is ready', async () =
   await io.ensure('hyperinkling')
   assert.equal(sleeping, false)
   assert.deepEqual(calls.map(([url, method]) => [url.slice(url.lastIndexOf('/')), method]), [
-    ['/is_sleeping', 'GET'], ['/is_sleeping', 'GET'], ['/wake_up', 'POST'], ['/is_sleeping', 'GET'],
+    ['/is_sleeping', 'GET'], ['/is_sleeping', 'GET'], ['/is_sleeping', 'GET'],
+    ['/wake_up', 'POST'], ['/is_sleeping', 'GET'],
   ])
 })
 
