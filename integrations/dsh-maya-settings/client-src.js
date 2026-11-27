@@ -15,12 +15,11 @@ export function readMayaValues(llmView, compactionView) {
   const provider = llmView.value?.providers?.[MAYA_PROVIDER]
   const model = provider?.models?.find((item) => item.id === MAYA_MODEL)
   if (!model) throw new Error('Maya provider/model entry was not found')
-  const policy = compactionView.value?.modelPolicies?.find((item) => item.provider === MAYA_PROVIDER && item.model === MAYA_MODEL)
-  if (!policy) throw new Error('Maya auto-compaction policy was not found')
+  const policy = compactionView?.value?.modelPolicies?.find((item) => item.provider === MAYA_PROVIDER && item.model === MAYA_MODEL)
   return {
     context: Number(model.contextWindow),
     maxTokens: Number(model.maxTokens),
-    compactPct: Math.round(Number(policy.thresholdRatio) * 100),
+    compactPct: policy ? Math.round(Number(policy.thresholdRatio) * 100) : null,
   }
 }
 
@@ -63,7 +62,12 @@ function MayaSettings({ load, describe, update, fetchImpl }) {
     if (!contextResponse.ok) throw new Error(`Could not read Maya context (${contextResponse.status})`)
     const context = await contextResponse.json()
     const llm = findNamespace(settings, 'llm-pi-ai')
-    const compaction = findNamespace(settings, 'compaction-basic')
+    // DSH's settings mirror exposes only volatile plugin fields. The built-in
+    // compaction config is non-volatile in the current profile, so it may not
+    // appear here; auto-compaction remains owned by the active agent preset.
+    const compaction = settings?.ok === true
+      ? settings.value?.namespaces?.find((entry) => entry.ns === 'compaction-basic') ?? null
+      : null
     const values = readMayaValues(llm, compaction)
     values.context = Number(context.context)
     setState({ status: 'ready', error: '', message, views: { llm, compaction }, draft: values, busy: false })
@@ -106,12 +110,12 @@ function MayaSettings({ load, describe, update, fetchImpl }) {
 
   const saveServing = async () => {
     const maxTokens = Number(state.draft.maxTokens)
-    const compactPct = Number(state.draft.compactPct)
     if (!Number.isSafeInteger(maxTokens) || maxTokens < 256 || maxTokens > 65536) {
       setState((current) => ({ ...current, error: 'Output cap must be a whole number from 256 to 65,536.' }))
       return
     }
-    if (!Number.isSafeInteger(compactPct) || compactPct < 50 || compactPct > 95) {
+    const compactPct = state.draft.compactPct === null ? null : Number(state.draft.compactPct)
+    if (compactPct !== null && (!Number.isSafeInteger(compactPct) || compactPct < 50 || compactPct > 95)) {
       setState((current) => ({ ...current, error: 'Auto-compaction must be from 50% to 95%.' }))
       return
     }
@@ -119,17 +123,20 @@ function MayaSettings({ load, describe, update, fetchImpl }) {
     try {
       const fresh = await describe()
       const llm = findNamespace(fresh, 'llm-pi-ai')
-      const compaction = findNamespace(fresh, 'compaction-basic')
       const llmResult = await update('llm-pi-ai', updateProviderPatch(llm, { maxTokens }), llm.revision)
       if (llmResult.ok !== true) throw new Error(llmResult.error?.message || 'Could not save Maya output cap')
-      const compactionResult = await update('compaction-basic', updateCompactionPatch(compaction, compactPct), compaction.revision)
-      if (compactionResult.ok !== true) {
-        // Restore the previous provider cap if the second namespace rejects its write.
-        const afterFailure = findNamespace(await describe(), 'llm-pi-ai')
-        await update('llm-pi-ai', updateProviderPatch(afterFailure, { maxTokens: Number(llm.value.providers[MAYA_PROVIDER].models.find((item) => item.id === MAYA_MODEL).maxTokens) }), afterFailure.revision)
-        throw new Error(compactionResult.error?.message || 'Could not save Maya auto-compaction threshold; output cap was restored')
+      if (compactPct !== null) {
+        const compaction = findNamespace(fresh, 'compaction-basic')
+        const compactionResult = await update('compaction-basic', updateCompactionPatch(compaction, compactPct), compaction.revision)
+        if (compactionResult.ok !== true) {
+          const afterFailure = findNamespace(await describe(), 'llm-pi-ai')
+          await update('llm-pi-ai', updateProviderPatch(afterFailure, { maxTokens: Number(llm.value.providers[MAYA_PROVIDER].models.find((item) => item.id === MAYA_MODEL).maxTokens) }), afterFailure.revision)
+          throw new Error(compactionResult.error?.message || 'Could not save Maya auto-compaction threshold; output cap was restored')
+        }
       }
-      await reload('Maya output cap and auto-compaction updated for new requests.')
+      await reload(compactPct === null
+        ? 'Maya output cap updated. Auto-compaction remains managed by the active DSH preset.'
+        : 'Maya output cap and auto-compaction updated for new requests.')
     } catch (error) {
       setState((current) => ({ ...current, busy: false, error: error.message || String(error) }))
     }
@@ -143,15 +150,19 @@ function MayaSettings({ load, describe, update, fetchImpl }) {
   if (state.status === 'loading') return React.createElement('div', null, 'Loading Maya settings…')
   return React.createElement('section', { style: { maxWidth: 520, padding: '8px 0', color: 'var(--fg)' } },
     React.createElement('h2', null, 'Maya local model'),
-    React.createElement('p', null, 'Edit Maya’s context, response cap, and automatic compaction from DSH.'),
+    React.createElement('p', null, 'Edit Maya’s context and response cap from DSH.'),
     state.draft ? React.createElement(React.Fragment, null,
       React.createElement(NumberField, { label: 'Context window (tokens)', value: state.draft.context, min: 4096, max: 262144, step: 1024, setValue: (v) => setDraft('context', v) }),
       React.createElement('p', null, 'Applying a context change reloads Maya. The chat can pause briefly while weights and cache are rebuilt.'),
       button('Apply context and reload Maya', applyContext),
       React.createElement('hr', { style: { margin: '22px 0', opacity: 0.25 } }),
       React.createElement(NumberField, { label: 'Maximum response tokens', value: state.draft.maxTokens, min: 256, max: 65536, step: 256, setValue: (v) => setDraft('maxTokens', v) }),
-      React.createElement(NumberField, { label: 'Auto-compaction trigger (%)', value: state.draft.compactPct, min: 50, max: 95, setValue: (v) => setDraft('compactPct', v) }),
-      React.createElement('p', null, 'These settings update the DSH provider and compaction policy without restarting DSH or Maya.'),
+      state.draft.compactPct !== null
+        ? React.createElement(NumberField, { label: 'Auto-compaction trigger (%)', value: state.draft.compactPct, min: 50, max: 95, setValue: (v) => setDraft('compactPct', v) })
+        : React.createElement('p', null, 'Auto-compaction is controlled by the active DSH preset. This profile does not expose that policy as a live setting.'),
+      React.createElement('p', null, state.draft.compactPct !== null
+        ? 'These settings update the DSH provider and compaction policy without restarting DSH or Maya.'
+        : 'The response cap updates DSH live. Context changes reload Maya.'),
       button('Save Maya settings', saveServing),
     ) : null,
     state.error ? React.createElement('p', { role: 'alert', style: { color: 'var(--danger, #f66)' } }, state.error) : null,
@@ -160,13 +171,15 @@ function MayaSettings({ load, describe, update, fetchImpl }) {
 }
 
 export function apply(ctx) {
-  const describe = () => ctx.remote.settings.describe()
-  const update = (ns, patch, revision) => ctx.remote.settings.update(ns, patch, revision)
-  ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section', id: 'maya-live-settings', order: 91,
-    label: () => 'Maya Local',
-    inject: () => ({ load: describe, describe, update, fetchImpl: fetch }),
-  }, MayaSettings))
+  ctx.inject(['slots', 'remote', 'remote.settings'], (clientCtx) => {
+    const describe = () => clientCtx.remote.settings.describe()
+    const update = (ns, patch, revision) => clientCtx.remote.settings.update(ns, patch, revision)
+    clientCtx.slots.inject('settings.section', () => clientCtx.slots.register({
+      name: 'settings.section', id: 'maya-live-settings', order: 91,
+      label: () => 'Maya Local',
+      inject: () => ({ load: describe, describe, update, fetchImpl: fetch }),
+    }, MayaSettings))
+  })
 }
 
 export const name = 'maya-live-settings'
