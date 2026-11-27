@@ -28,6 +28,7 @@ td.log
 /build/
 /third_party/llama.cpp/
 /models/
+/ik2/tokenizer/
 /packs/
 /mtp/
 /run-*.bat

@@ -1,0 +1,18 @@
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 03b7951c3..a75aeb6c1 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -1047,0 +1048,5 @@ llm_arch llm_arch_from_string(const std::string & name) {
++    // Maya's vision encoder only needs the Inkling tokenizer from the text GGUF;
++    // the full loop model is served by maya-ik2, not llama.cpp.
++    if (name == "inkling2_loop") {
++        return LLM_ARCH_QWEN3;
++    }
+diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
+index e038637ce..41af9fa3f 100644
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -2266 +2266,2 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
+-                    tokenizer_pre == "qwen35") {
++                    tokenizer_pre == "qwen35" ||
++                    tokenizer_pre == "inkling2") {
