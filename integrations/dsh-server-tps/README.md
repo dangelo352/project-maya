@@ -1,34 +1,24 @@
-# DSH server-wide approximate TPS pill
+# DSH generated-token TPS pill
 
-This self-contained profile plugin targets DeepSeek Harness `0.2.2-rc.5`. Its Host half wraps the RC5 `llm/stream` waterfall for every provider and observes text, reasoning, and tool-argument delta events. It stores only event timestamps in a bounded two-second window and a concurrent active-stream count. It never stores or returns prompts, generated text, provider names, model names, or session identifiers.
+This DeepSeek Harness profile plugin reports output TPS from cumulative counters exposed by the local inference engines. It does not infer token counts from stream chunks.
 
-The owner-only snapshot is served by DSH's authenticated Connection Fetch route at `/api/dsh-server-tps`. It returns only `{ approx_tps, active_streams, window_ms, timestamp }`. `approx_tps` is a chunk/delta rate, not tokenizer-exact TPS. DSH's desktop shell forwards this same-origin API request through its authenticated host connection, while the Tailscale browser uses the normal authenticated web route. The plugin does not expose a second listener.
+- Qwen/vLLM: `vllm:generation_tokens_total` from `127.0.0.1:18020/metrics`.
+- Maya/Inkling: `llamacpp:tokens_predicted_total` from `127.0.0.1:18022/metrics/prometheus`.
+- HyperInkling: `vllm:generation_tokens_total` from `127.0.0.1:18023/metrics`.
 
-## Install in an RC5 profile
+The plugin samples these counters when the authenticated DSH route is polled and reports the generated-token delta per second over a rolling window of up to two seconds. A counter reset establishes a new baseline, so a server restart cannot appear as a burst of generated tokens. Multiple open DSH clients share a throttled sample and do not distort the rate. Only the number and state are returned; no prompt, output text, model name, or session identifier is collected.
 
-1. Copy this directory to a stable location on the DSH host, or leave it at `E:\Project-Maya\integrations\dsh-server-tps`.
-2. From the profile directory, add the local package dependency (adjust the path if copied):
+The composer pill displays only `NN.N TPS`. It does not display active-stream counts. A reachable backend with no recent generated tokens displays `0.0 TPS`; if all three metric endpoints are unavailable, it displays `TPS unavailable`.
 
-   ```powershell
-   pnpm add 'file:E:/Project-Maya/integrations/dsh-server-tps'
-   ```
+## Install in the desktop profile
 
-3. Build the browser entry if you changed `client-src.js`:
-
-   ```powershell
-   cd E:/Project-Maya/integrations/dsh-server-tps
-   npm install
-   npm run bundle:client
-   ```
-
-4. Ensure the profile's bundle list includes `@maya/dsh-server-tps` if the local profile manager did not activate it automatically. The included `cordis.patch.yml` adds the Host plugin; package metadata publishes its web client face.
-5. Restart DSH after changing the Host plugin. The pill appears in the composer dock and refreshes once per second. A stale display means there has been no fresh snapshot; a disconnected display means the authenticated DSH API route is unavailable. It does not make a network request to Maya.
-
-## Development checks
+The desktop profile links this package from `E:\Project-Maya\integrations\dsh-server-tps` and already includes it in its bundle list. After changing the Host plugin, restart DeepSeek Harness so the updated server plugin loads. The client bundle is generated from `client-src.js`.
 
 ```powershell
+cd E:/Project-Maya/integrations/dsh-server-tps
+npm install
 npm test
 npm run bundle:client
 ```
 
-`llm/stream` is the RC5 waterfall signature `(options, next) => AsyncIterable<StreamChunk>`. The observer returns every original chunk unchanged and decrements active count even when a consumer cancels or the stream throws.
+The plugin exposes only the DSH authenticated Connection Fetch route `/api/dsh-server-tps`; it opens no listener of its own.

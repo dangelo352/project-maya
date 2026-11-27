@@ -2,7 +2,7 @@
   "name": "@maya/dsh-server-tps",
   "version": "1.0.0",
   "private": true,
-  "description": "Owner-scoped live aggregate output-rate pill for DeepSeek Harness RC5",
+  "description": "Owner-scoped generated-token TPS pill for DeepSeek Harness RC5",
   "type": "module",
   "main": "./index.js",
   "exports": {

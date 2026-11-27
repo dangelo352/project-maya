@@ -4,19 +4,18 @@ const ROUTE = '/api/dsh-server-tps'
 
 export function formatPill(snapshot, now = Date.now()) {
   if (!snapshot || !Number.isFinite(snapshot.timestamp)
-    || !Number.isFinite(snapshot.approx_tps) || !Number.isFinite(snapshot.active_streams)) {
-    return { text: '~TPS · unavailable', state: 'unavailable', title: 'LLM stream rate unavailable' }
+    || !Number.isFinite(snapshot.tps)) {
+    return { text: 'TPS unavailable', state: 'unavailable', title: 'Inference token counter unavailable' }
   }
   const age = now - snapshot.timestamp
   if (age < -2000 || age > STALE_MS) {
-    return { text: '~TPS · stale', state: 'stale', title: 'LLM stream rate is stale' }
+    return { text: 'TPS unavailable', state: 'stale', title: 'Inference token counter is stale' }
   }
-  const speed = snapshot.approx_tps.toFixed(1)
-  const activity = `${snapshot.active_streams} active stream${snapshot.active_streams === 1 ? '' : 's'}`
+  const speed = snapshot.tps.toFixed(1)
   return {
-    text: `~${speed} TPS · ${activity}`,
-    state: 'live',
-    title: `Approximate output delta rate over ${snapshot.window_ms || 2000} ms across all DSH providers`,
+    text: `${speed} TPS`,
+    state: snapshot.state === 'unavailable' ? 'unavailable' : snapshot.state,
+    title: `Generated tokens per second, measured from local inference-engine counters over up to ${snapshot.window_ms || 2000} ms`,
   }
 }
 
@@ -51,7 +50,7 @@ export function mount(React, slots, fetchImpl = fetch) {
     }, [])
 
     const status = failed
-      ? { text: '~TPS · disconnected', state: 'stale', title: 'DSH aggregate stream endpoint is unreachable' }
+      ? { text: 'TPS unavailable', state: 'stale', title: 'DSH inference token counter is unreachable' }
       : formatPill(snapshot)
     return h('span', {
       title: status.title,
@@ -66,7 +65,7 @@ export function mount(React, slots, fetchImpl = fetch) {
     }, status.text)
   }
   slots.inject('conversation.composer.dock', () => slots.register({
-    name: 'conversation.composer.dock', id: 'dsh-server-tps', order: 20, label: 'DSH approximate TPS',
+    name: 'conversation.composer.dock', id: 'dsh-server-tps', order: 20, label: 'DSH generated TPS',
   }, Pill))
 }
 
