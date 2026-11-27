@@ -65,14 +65,49 @@ function elapsedLabel(ms) {
 function statusUrl(sessionId) {
   return `${ROUTE}?sessionId=${encodeURIComponent(sessionId)}`;
 }
-function mount(React2, slots, remoteSession, fetchImpl = fetch) {
+function compactionLifecycle(entries) {
+  const open = /* @__PURE__ */ new Map();
+  let finished = null;
+  for (const entry of entries || []) {
+    const event = entry.event || entry;
+    if (event.type === "turn/start" || event.type === "turn/end" && event.data?.reason?.kind === "aborted") open.clear();
+    const id = event.data?.compactionId;
+    if (event.type === "compaction/start" && id) {
+      open.set(id, { id, phase: "compacting", startedAt: event.time });
+    } else if (event.type === "compaction/summary" && open.has(id)) {
+      open.set(id, { ...open.get(id), phase: "saving-summary" });
+    } else if (event.type === "compaction/end" && open.has(id)) {
+      finished = { ...open.get(id), phase: event.data.error ? "compaction-error" : "compacted", finishedAt: event.time };
+      open.delete(id);
+    }
+  }
+  return [...open.values()].at(-1) || finished;
+}
+function mount(React2, slots, remoteSession, fetchImpl = fetch, sessions) {
   const h = React2.createElement;
   function SwitchCard({ sessionId, useSession }) {
     const running = useSession((value) => value.running);
+    const [compaction, setCompaction] = React2.useState(null);
+    const [clock, setClock] = React2.useState(Date.now());
     const [rate, setRate] = React2.useState(null);
     const [snapshot, setSnapshot] = React2.useState(null);
     const [elapsed, setElapsed] = React2.useState(0);
     const [cancelState, setCancelState] = React2.useState("idle");
+    React2.useEffect(() => {
+      const source = sessions?.binding(sessionId)?.eventSource;
+      if (!source) return void 0;
+      const update = () => {
+        const next = compactionLifecycle(source.getSnapshot().entries);
+        setCompaction((previous) => previous?.id === next?.id && previous?.phase === next?.phase ? previous : next);
+      };
+      update();
+      const unsubscribe = source.subscribe(update);
+      const timer = setInterval(() => setClock(Date.now()), 1e3);
+      return () => {
+        unsubscribe();
+        clearInterval(timer);
+      };
+    }, [sessionId]);
     React2.useEffect(() => {
       if (!sessionId) {
         setSnapshot(null);
@@ -140,15 +175,18 @@ function mount(React2, slots, remoteSession, fetchImpl = fetch) {
     React2.useEffect(() => {
       setCancelState("idle");
     }, [snapshot?.startedAt]);
-    const visible = snapshot?.sessionId === sessionId && (!snapshot.observed || running || snapshot.phase === "loading");
+    const compacting = compaction && ["compacting", "saving-summary"].includes(compaction.phase);
+    const recentCompaction = compaction?.finishedAt && clock - compaction.finishedAt < 5e3;
+    const visible = compacting || recentCompaction || snapshot?.sessionId === sessionId && (!snapshot.observed || running || snapshot.phase === "loading");
     if (!visible) return null;
-    const phase = snapshot.phase;
+    const status = snapshot || {};
+    const phase = compacting || recentCompaction ? compaction.phase : status.phase;
     const serving = phase === "serving";
-    const done = phase === "ready" || serving;
-    const failed = phase === "error";
+    const done = phase === "ready" || serving || phase === "compacted";
+    const failed = phase === "error" || phase === "compaction-error";
     const waiting = phase === "waiting-for-active-request";
-    const blockers = [...new Set(snapshot.blockingSessionIds || [])];
-    const modelName = snapshot.model || snapshot.backend;
+    const blockers = [...new Set(status.blockingSessionIds || [])];
+    const modelName = status.model || status.backend || "Local model";
     const trackStyle = {
       height: 5,
       borderRadius: 99,
@@ -177,15 +215,15 @@ function mount(React2, slots, remoteSession, fetchImpl = fetch) {
       }
     };
     const textColor = failed ? "var(--danger, #ef6262)" : "var(--dsw-alias-label-primary)";
-    const phaseLabel = serving ? rate?.state === "live" ? `Engine generating \uFFFD ${rate.tps.toFixed(1)} tokens/sec` : "Model loaded \uFFFD no new engine tokens measured" : phaseLabels[phase] || "Switching local model";
-    const duration = done || failed ? Math.max(0, (snapshot.finishedAt || Date.now()) - snapshot.startedAt) : elapsed;
+    const phaseLabel = compacting ? phase === "saving-summary" ? "Saving conversation summary" : "Compacting conversation" : phase === "compacted" ? "Compaction finished" : phase === "compaction-error" ? "Compaction failed" : serving ? rate?.state === "live" ? `Engine generating - ${rate.tps.toFixed(1)} tokens/sec` : "Model loaded - no new engine tokens measured" : phaseLabels[phase] || "Waiting for backend status";
+    const duration = compaction && (compacting || recentCompaction) ? (compaction.finishedAt || clock) - compaction.startedAt : done || failed ? Math.max(0, (status.finishedAt || Date.now()) - (status.startedAt || Date.now())) : elapsed;
     return h(
       "div",
       {
         "data-maya-model-switch": phase,
         role: "status",
         "aria-live": "polite",
-        title: snapshot.error || `${modelName}: ${phaseLabel}. Engine token readings are shared across sessions.`,
+        title: status.error || `${phaseLabel}${compacting ? " - preserving conversation context" : `. Engine token readings are shared across sessions.`}`,
         style: {
           display: "flex",
           alignItems: "center",
@@ -211,9 +249,9 @@ function mount(React2, slots, remoteSession, fetchImpl = fetch) {
       h(
         "span",
         { style: { minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
-        snapshot.error ? `Load failed: ${snapshot.error}` : phaseLabel
+        status.error ? `Load failed: ${status.error}` : phaseLabel
       ),
-      !snapshot.observed ? h("span", { style: { marginLeft: "auto", flex: "0 0 auto", fontVariantNumeric: "tabular-nums" } }, elapsedLabel(duration)) : null
+      compacting || !status.observed ? h("span", { style: { marginLeft: "auto", flex: "0 0 auto", fontVariantNumeric: "tabular-nums" } }, elapsedLabel(compacting ? clock - compaction.startedAt : duration)) : null
     );
   }
   slots.inject("conversation.input.dock", () => slots.register({
@@ -236,7 +274,7 @@ function apply(ctx) {
         return session.cancel();
       }
     };
-    mount(import_react.default, clientCtx.slots, sessionActions);
+    mount(import_react.default, clientCtx.slots, sessionActions, fetch, clientCtx.sessions);
   });
 }
 var client_entry_default = apply;

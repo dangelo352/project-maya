@@ -13,7 +13,7 @@ export function apply(ctx) {
         return session.cancel()
       },
     }
-    mount(React, clientCtx.slots, sessionActions)
+    mount(React, clientCtx.slots, sessionActions, fetch, clientCtx.sessions)
   })
 }
 

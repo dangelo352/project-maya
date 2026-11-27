@@ -40,15 +40,49 @@ function backendDetail(snapshot) {
   return 'Waiting for the local backend status endpoint.'
 }
 
-export function mount(React, slots, remoteSession, fetchImpl = fetch) {
+export function compactionLifecycle(entries) {
+  const open = new Map()
+  let finished = null
+  for (const entry of entries || []) {
+    const event = entry.event || entry
+    if (event.type === 'turn/start' || (event.type === 'turn/end' && event.data?.reason?.kind === 'aborted')) open.clear()
+    const id = event.data?.compactionId
+    if (event.type === 'compaction/start' && id) {
+      open.set(id, {id, phase:'compacting', startedAt:event.time})
+    } else if (event.type === 'compaction/summary' && open.has(id)) {
+      open.set(id, {...open.get(id),phase:'saving-summary'})
+    } else if (event.type === 'compaction/end' && open.has(id)) {
+      finished = {...open.get(id),phase:event.data.error ? 'compaction-error' : 'compacted',finishedAt:event.time}
+      open.delete(id)
+    }
+  }
+  return [...open.values()].at(-1) || finished
+}
+
+export function mount(React, slots, remoteSession, fetchImpl = fetch, sessions) {
   const h = React.createElement
 
   function SwitchCard({ sessionId, useSession }) {
     const running = useSession(value => value.running)
+    const [compaction, setCompaction] = React.useState(null)
+    const [clock, setClock] = React.useState(Date.now())
     const [rate, setRate] = React.useState(null)
     const [snapshot, setSnapshot] = React.useState(null)
     const [elapsed, setElapsed] = React.useState(0)
     const [cancelState, setCancelState] = React.useState('idle')
+
+    React.useEffect(() => {
+      const source = sessions?.binding(sessionId)?.eventSource
+      if (!source) return undefined
+      const update = () => {
+        const next = compactionLifecycle(source.getSnapshot().entries)
+        setCompaction(previous => previous?.id === next?.id && previous?.phase === next?.phase ? previous : next)
+      }
+      update()
+      const unsubscribe = source.subscribe(update)
+      const timer = setInterval(() => setClock(Date.now()), 1000)
+      return () => { unsubscribe(); clearInterval(timer) }
+    }, [sessionId])
 
     React.useEffect(() => {
       if (!sessionId) { setSnapshot(null); return undefined }
@@ -105,16 +139,19 @@ export function mount(React, slots, remoteSession, fetchImpl = fetch) {
 
     React.useEffect(() => { setCancelState('idle') }, [snapshot?.startedAt])
 
-    const visible = snapshot?.sessionId === sessionId && (!snapshot.observed || running || snapshot.phase === 'loading')
+    const compacting = compaction && ['compacting', 'saving-summary'].includes(compaction.phase)
+    const recentCompaction = compaction?.finishedAt && clock - compaction.finishedAt < 5000
+    const visible = compacting || recentCompaction || (snapshot?.sessionId === sessionId && (!snapshot.observed || running || snapshot.phase === 'loading'))
     if (!visible) return null
 
-    const phase = snapshot.phase
+    const status = snapshot || {}
+    const phase = compacting || recentCompaction ? compaction.phase : status.phase
     const serving = phase === 'serving'
-    const done = phase === 'ready' || serving
-    const failed = phase === 'error'
+    const done = phase === 'ready' || serving || phase === 'compacted'
+    const failed = phase === 'error' || phase === 'compaction-error'
     const waiting = phase === 'waiting-for-active-request'
-    const blockers = [...new Set(snapshot.blockingSessionIds || [])]
-    const modelName = snapshot.model || snapshot.backend
+    const blockers = [...new Set(status.blockingSessionIds || [])]
+    const modelName = status.model || status.backend || 'Local model'
     const trackStyle = {
       height: 5, borderRadius: 99, overflow: 'hidden',
       background: 'var(--bg-soft, rgba(127,127,127,.2))',
@@ -142,12 +179,12 @@ export function mount(React, slots, remoteSession, fetchImpl = fetch) {
     }
 
     const textColor = failed ? 'var(--danger, #ef6262)' : 'var(--dsw-alias-label-primary)'
-    const phaseLabel = serving ? (rate?.state === 'live' ? `Engine generating · ${rate.tps.toFixed(1)} tokens/sec` : 'Model loaded · no new engine tokens measured') : (phaseLabels[phase] || 'Switching local model')
-    const duration = done || failed ? Math.max(0, (snapshot.finishedAt || Date.now()) - snapshot.startedAt) : elapsed
+    const phaseLabel = compacting ? (phase === 'saving-summary' ? 'Saving conversation summary' : 'Compacting conversation') : phase === 'compacted' ? 'Compaction finished' : phase === 'compaction-error' ? 'Compaction failed' : serving ? (rate?.state === 'live' ? `Engine generating - ${rate.tps.toFixed(1)} tokens/sec` : 'Model loaded - no new engine tokens measured') : (phaseLabels[phase] || 'Waiting for backend status')
+    const duration = compaction && (compacting || recentCompaction) ? (compaction.finishedAt || clock) - compaction.startedAt : done || failed ? Math.max(0, (status.finishedAt || Date.now()) - (status.startedAt || Date.now())) : elapsed
 
     return h('div', {
       'data-maya-model-switch': phase, role: 'status', 'aria-live': 'polite',
-      title: snapshot.error || `${modelName}: ${phaseLabel}. Engine token readings are shared across sessions.`,
+      title: status.error || `${phaseLabel}${compacting ? ' - preserving conversation context' : `. Engine token readings are shared across sessions.`}`,
       style: { display: 'flex', alignItems: 'center', gap: 8, minHeight: 22,
         width: '100%', maxWidth: 'var(--dsh-composer-card-max-width)', boxSizing: 'border-box',
         padding: '0 12px', margin: '0 auto 3px', fontFamily: 'var(--dsw-font-family)',
@@ -161,8 +198,8 @@ export function mount(React, slots, remoteSession, fetchImpl = fetch) {
         style: { width: 42, height: 3, borderRadius: 4, overflow: 'hidden', flex: '0 0 auto', background: 'var(--dsw-alias-border-l2)' },
       }, h('i', { style: { display: 'block', width: '38%', height: '100%', background: 'var(--dsw-alias-state-business-primary)', animation: 'maya-switch-travel 1.45s ease-in-out infinite' } })) : null,
       h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-        snapshot.error ? `Load failed: ${snapshot.error}` : phaseLabel),
-      !snapshot.observed ? h('span', { style: { marginLeft: 'auto', flex: '0 0 auto', fontVariantNumeric: 'tabular-nums' } }, elapsedLabel(duration)) : null,
+        status.error ? `Load failed: ${status.error}` : phaseLabel),
+      (compacting || !status.observed) ? h('span', { style: { marginLeft: 'auto', flex: '0 0 auto', fontVariantNumeric: 'tabular-nums' } }, elapsedLabel(compacting ? clock - compaction.startedAt : duration)) : null,
     )
   }
 
