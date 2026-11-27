@@ -1,0 +1,91 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { BackendGate, BACKENDS } from '../lib/index.js'
+
+function deferred() {
+  let resolve
+  const promise = new Promise(r => { resolve = r })
+  return { promise, resolve }
+}
+
+function clients(overrides = {}) {
+  const calls = []
+  return {
+    calls,
+    loaded: async backend => { calls.push(['status', backend]); return false },
+    unload: async backend => { calls.push(['unload', backend]); return { status: 'unloaded' } },
+    ...overrides,
+  }
+}
+
+test('same selected backend is a no-op and aliases map exactly', async () => {
+  const io = clients()
+  const gate = new BackendGate({ clients: io })
+  gate.currentBackend = 'qwen'
+  const release = await gate.acquire('hyperqwen-local-compact')
+  assert.equal(gate.activeRequests, 1)
+  release()
+  assert.deepEqual(io.calls, [])
+  assert.deepEqual(BACKENDS, {
+    'maya-local': 'maya', 'maya-local-compact': 'maya',
+    'hyperqwen-local': 'qwen', 'hyperqwen-local-compact': 'qwen',
+  })
+})
+
+test('same backend requests overlap without unloading', async () => {
+  const io = clients()
+  const gate = new BackendGate({ clients: io })
+  gate.currentBackend = 'maya'
+  const a = await gate.acquire('maya-local')
+  const b = await gate.acquire('maya-local-compact')
+  assert.equal(gate.activeRequests, 2)
+  a(); b()
+  assert.deepEqual(io.calls, [])
+})
+
+test('backend switch waits for active calls to drain before unloading', async () => {
+  const started = deferred()
+  const io = clients({ unload: async backend => { io.calls.push(['unload', backend]); return { status: 'unloaded' } } })
+  const gate = new BackendGate({ clients: io })
+  gate.currentBackend = 'maya'
+  const release = await gate.acquire('maya-local')
+  const switching = gate.acquire('hyperqwen-local')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(io.calls, [])
+  started.resolve()
+  release()
+  const releaseQwen = await switching
+  assert.deepEqual(io.calls, [['unload', 'maya']])
+  assert.equal(gate.currentBackend, 'qwen')
+  releaseQwen()
+})
+
+test('unload failure rejects the switch and preserves prior backend', async () => {
+  const gate = new BackendGate({ clients: clients({ unload: async () => { throw new Error('Maya unload busy') } }) })
+  gate.currentBackend = 'maya'
+  await assert.rejects(gate.acquire('hyperqwen-local'), /Maya unload busy/)
+  assert.equal(gate.currentBackend, 'maya')
+  assert.equal(gate.activeRequests, 0)
+})
+
+test('unknown bootstrap probes both endpoints and unloads loaded non-target', async () => {
+  const io = clients({
+    loaded: async backend => { io.calls.push(['status', backend]); return backend === 'maya' },
+  })
+  const gate = new BackendGate({ clients: io })
+  const release = await gate.acquire('hyperqwen-local')
+  assert.deepEqual(io.calls, [['status', 'maya'], ['status', 'qwen'], ['unload', 'maya']])
+  assert.equal(gate.currentBackend, 'qwen')
+  release()
+})
+
+test('unknown bootstrap retains target when it is already loaded', async () => {
+  const io = clients({
+    loaded: async backend => { io.calls.push(['status', backend]); return backend === 'maya' },
+  })
+  const gate = new BackendGate({ clients: io })
+  const release = await gate.acquire('maya-local')
+  assert.deepEqual(io.calls, [['status', 'maya'], ['status', 'qwen']])
+  assert.equal(gate.currentBackend, 'maya')
+  release()
+})

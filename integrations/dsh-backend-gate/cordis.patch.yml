@@ -1,0 +1,4 @@
+# Bundle activation entry. The parent profile still owns provider configuration.
+- insert:
+    - id: maya-backend-gate
+      name: '@maya/dsh-backend-gate'

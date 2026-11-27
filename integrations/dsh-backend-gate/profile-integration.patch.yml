@@ -1,0 +1,8 @@
+# EXAMPLE ONLY: merge into the selected profile's cordis.patch.yml after
+# installing the package and enabling it in dsh.profile.bundles. Keep Maya as
+# the default by preserving the profile's current default-model row/config.
+# This adds just the gate plugin row; provider entries belong in the existing
+# llm-pi-ai config.providers map (see README.md).
+- insert:
+    - id: maya-backend-gate
+      name: '@maya/dsh-backend-gate'
