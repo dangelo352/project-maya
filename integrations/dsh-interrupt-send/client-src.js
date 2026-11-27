@@ -61,7 +61,7 @@ export function mount(React, slots, remoteSession, sessions) {
       && ['plain', 'claimed'].includes(input?.phase)
       && typeof inputActions?.persistDraft === 'function'
       && typeof inputActions?.submit === 'function')
-    if (!canSubmit && !busyAction) return null
+    if (!sessionId) return null
 
     const draft = input?.draft?.trim() || ''
     const canSteer = canSubmit && Boolean(draft)
@@ -140,7 +140,7 @@ export function mount(React, slots, remoteSession, sessions) {
     const disabled = !canSubmit || Boolean(busyAction)
     return h('div', {
       'data-dsh-busy-draft-actions': '',
-      style: { display: 'flex', alignItems: 'center', gap: 6, minHeight: 30 },
+      style: { display: 'flex', justifyContent: 'flex-end', alignItems: 'center', flexWrap: 'wrap', gap: 6, minHeight: 30, marginBottom: 6 },
     },
       notice ? h('span', {
         role: 'status', 'aria-live': 'polite',

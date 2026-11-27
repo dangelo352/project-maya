@@ -101,7 +101,7 @@ function mount(React2, slots, remoteSession, sessions) {
     actionsRef.current = inputActions;
     const sessionId = session?.sessionId;
     const canSubmit = Boolean(session?.running && sessionId && hasDraft(input) && ["plain", "claimed"].includes(input?.phase) && typeof inputActions?.persistDraft === "function" && typeof inputActions?.submit === "function");
-    if (!canSubmit && !busyAction) return null;
+    if (!sessionId) return null;
     const draft = input?.draft?.trim() || "";
     const canSteer = canSubmit && Boolean(draft) && input?.attachmentIds?.length === 0 && input?.occurrences?.length === 0 && !input?.claim && !draft.startsWith("/") && typeof sessions?.binding === "function";
     const steer = async () => {
@@ -176,7 +176,7 @@ function mount(React2, slots, remoteSession, sessions) {
       "div",
       {
         "data-dsh-busy-draft-actions": "",
-        style: { display: "flex", alignItems: "center", gap: 6, minHeight: 30 }
+        style: { display: "flex", justifyContent: "flex-end", alignItems: "center", flexWrap: "wrap", gap: 6, minHeight: 30, marginBottom: 6 }
       },
       notice ? h("span", {
         role: "status",
@@ -209,10 +209,17 @@ function mount(React2, slots, remoteSession, sessions) {
 
 // client-entry.js
 var name = "dsh-interrupt-send";
-var inject = ["slots", "remote.session", "sessions"];
+var inject = [];
 function apply(ctx) {
-  ctx.inject(["slots", "remote.session", "sessions"], (clientCtx) => {
-    mount(import_react.default, clientCtx.slots, clientCtx.remote.session, clientCtx.sessions);
+  ctx.inject(["slots", "sessions"], (clientCtx) => {
+    const sessionActions = {
+      cancel: ({ sessionId }) => {
+        const session = clientCtx.sessions.binding(sessionId)?.session;
+        if (!session) throw new Error("The selected DSH session is no longer available.");
+        return session.cancel();
+      }
+    };
+    mount(import_react.default, clientCtx.slots, sessionActions, clientCtx.sessions);
   });
 }
 var client_entry_default = apply;

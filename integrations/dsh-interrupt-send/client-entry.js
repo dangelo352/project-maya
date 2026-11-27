@@ -2,11 +2,18 @@ import React from 'react'
 import { mount } from './client-src.js'
 
 export const name = 'dsh-interrupt-send'
-export const inject = ['slots', 'remote.session', 'sessions']
+export const inject = []
 
 export function apply(ctx) {
-  ctx.inject(['slots', 'remote.session', 'sessions'], clientCtx => {
-    mount(React, clientCtx.slots, clientCtx.remote.session, clientCtx.sessions)
+  ctx.inject(['slots', 'sessions'], clientCtx => {
+    const sessionActions = {
+      cancel: ({ sessionId }) => {
+        const session = clientCtx.sessions.binding(sessionId)?.session
+        if (!session) throw new Error('The selected DSH session is no longer available.')
+        return session.cancel()
+      },
+    }
+    mount(React, clientCtx.slots, sessionActions, clientCtx.sessions)
   })
 }
 

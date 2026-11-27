@@ -452,15 +452,25 @@ export class BackendGate {
       // wake competing waiters inside transition(), one could switch backends
       // before this caller increments activeRequests.
       this.transitioning = true
+      let showRequestLoad = false
       try {
+      showRequestLoad = this.currentBackend !== target || !(await this.clients.loaded(target))
+      if (showRequestLoad) {
+        this.switchStatus = {
+          sessionId: String(sessionId ?? ''), provider, model, backend: target,
+          phase: 'loading', startedAt: Date.now(), updatedAt: Date.now(),
+        }
+      }
         if (this.currentBackend === target) await this.clients.ensure?.(target, model)
         else await this.transition(target, undefined, model)
+        if (showRequestLoad) this.updateSwitch('ready', { finishedAt: Date.now() })
         this.activeRequests += 1
         this.addActiveSession(sessionId)
         this.transitioning = false
         this.notify()
         return this.releaseOnce(sessionId, true)
       } catch (error) {
+        if (showRequestLoad) this.updateSwitch('error', { error: error?.message ?? String(error), finishedAt: Date.now() })
         this.transitioning = false
         this.notify()
         throw error

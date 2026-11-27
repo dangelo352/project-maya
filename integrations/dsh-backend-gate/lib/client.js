@@ -268,10 +268,17 @@ function mount(React2, slots, remoteSession, fetchImpl = fetch) {
 
 // client-entry.js
 var name = "maya-model-switch-card";
-var inject = ["slots", "remote.session"];
+var inject = [];
 function apply(ctx) {
-  ctx.inject(["slots", "remote.session"], (clientCtx) => {
-    mount(import_react.default, clientCtx.slots, clientCtx.remote.session);
+  ctx.inject(["slots", "sessions"], (clientCtx) => {
+    const sessionActions = {
+      cancel: ({ sessionId }) => {
+        const session = clientCtx.sessions.binding(sessionId)?.session;
+        if (!session) throw new Error("The selected DSH session is no longer available.");
+        return session.cancel();
+      }
+    };
+    mount(import_react.default, clientCtx.slots, sessionActions);
   });
 }
 var client_entry_default = apply;

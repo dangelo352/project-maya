@@ -40,7 +40,7 @@ if (face.name !== 'maya-model-switch-card' || typeof face.apply !== 'function') 
 let slotRegistered = false
 face.apply({
   inject(names, callback) {
-    if (JSON.stringify(names) !== JSON.stringify(['slots', 'remote.session'])) throw new Error('unexpected client injection')
+    if (JSON.stringify(names) !== JSON.stringify(['slots', 'sessions'])) throw new Error('unexpected client injection')
     callback({
       slots: {
         inject(name, register) {
@@ -52,7 +52,7 @@ face.apply({
           slotRegistered = true
         },
       },
-      remote: { session: { cancel: async () => ({ ok: true, value: { accepted: true } }) } },
+      sessions: { binding: () => ({ session: { cancel: async () => ({ ok: true, value: { accepted: true } }) } }) },
     })
   },
 })
