@@ -74,7 +74,7 @@ hyperinkling-local-compact:
 
 ## On-demand HyperInkling service (Windows + WSL)
 
-Install `hyperinkling.service` into `/etc/systemd/system/` after editing its paths for the local clone. Create a private `.env` beside `start.sh` with the exact model path and serving settings. Keep `HOST=127.0.0.1`, `PORT=18023`, `DASHBOARD=0`, `MAX_LEN=auto`, `KEEP_FREE_GB=2`, and `EXTRA_ARGS=--enable-sleep-mode`. Use `SPEC=dflash2` for best ordinary chat/code speed if its drafter is installed; use `SPEC=dspark` for long-document summarization. The unit is deliberately not enabled at boot: the DSH gate starts it when the HyperInkling route is selected. `Restart=on-failure` recovers a crashed server while preserving on-demand startup.
+Install `hyperinkling.service` into `/etc/systemd/system/` after editing its paths for the local clone. Create a private `.env` beside `start.sh` with the exact model path and serving settings. Keep `HOST=127.0.0.1`, `PORT=18023`, `DASHBOARD=0`, `MAX_LEN=auto`, `KEEP_FREE_GB=2`, and `EXTRA_ARGS=--enable-sleep-mode`. Set `IMAGES=999`, the upstream limit; the context window, rather than a small image-count cap, is the practical bound. Use `SPEC=dflash2` for best ordinary chat/code speed if its drafter is installed; use `SPEC=dspark` for long-document summarization. The unit is deliberately not enabled at boot: the DSH gate starts it when the HyperInkling route is selected. `Restart=on-failure` recovers a crashed server while preserving on-demand startup.
 
 The gate invokes `wsl.exe -d Ubuntu -u root -- systemctl start hyperinkling.service`. Change `distro` and `serviceUnit` in the gate configuration if the local unit uses different names. Do not configure both HyperInkling and another model to start automatically on boot.
 
