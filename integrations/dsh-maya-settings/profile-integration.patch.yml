@@ -1,0 +1,6 @@
+# Merge this package row into the selected profile's cordis.patch.yml and add
+# @maya/dsh-maya-settings to its dsh.profile.bundles list. Preserve all other
+# bundles and the current Maya default-model row.
+- insert:
+    - id: maya-live-settings
+      name: '@maya/dsh-maya-settings'

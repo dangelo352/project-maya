@@ -1,0 +1,35 @@
+{
+  "name": "@maya/dsh-maya-settings",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Live Maya serving controls and compaction settings for DeepSeek Harness",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "bundle:client": "node ./scripts/build-client.mjs",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "react": "^18.3.1"
+  },
+  "peerDependencies": {
+    "react": "^18.2.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  }
+}

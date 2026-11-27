@@ -1,0 +1,4 @@
+# Adds the owner-only Maya live settings bridge and browser settings page.
+- insert:
+    - id: maya-live-settings
+      name: '@maya/dsh-maya-settings'
