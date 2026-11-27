@@ -89,3 +89,38 @@ test('unknown bootstrap retains target when it is already loaded', async () => {
   assert.equal(gate.currentBackend, 'maya')
   release()
 })
+
+test('bootstrap reserves its backend before waking a competing switch', async () => {
+  const statusesReady = deferred()
+  const statusStarted = deferred()
+  const io = clients({
+    loaded: async backend => {
+      io.calls.push(['status', backend])
+      if (backend === 'maya') {
+        statusStarted.resolve()
+        await statusesReady.promise
+        return true
+      }
+      return false
+    },
+  })
+  const gate = new BackendGate({ clients: io })
+  const mayaRequest = gate.acquire('maya-local')
+  await statusStarted.promise
+  const qwenRequest = gate.acquire('hyperqwen-local')
+
+  statusesReady.resolve()
+  const releaseMaya = await mayaRequest
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(gate.currentBackend, 'maya')
+  assert.equal(gate.activeRequests, 1)
+  assert.deepEqual(io.calls, [['status', 'maya'], ['status', 'qwen']])
+
+  releaseMaya()
+  const releaseQwen = await qwenRequest
+  assert.deepEqual(io.calls, [
+    ['status', 'maya'], ['status', 'qwen'], ['unload', 'maya'],
+  ])
+  assert.equal(gate.currentBackend, 'qwen')
+  releaseQwen()
+})

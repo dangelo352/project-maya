@@ -109,19 +109,12 @@ export class BackendGate {
   }
 
   async transition(target) {
-    this.transitioning = true
-    this.notify()
-    try {
-      if (this.currentBackend === null) {
-        await this.reconcile(target)
-      } else {
-        const previous = this.currentBackend
-        await this.clients.unload(previous)
-        this.currentBackend = target
-      }
-    } finally {
-      this.transitioning = false
-      this.notify()
+    if (this.currentBackend === null) {
+      await this.reconcile(target)
+    } else {
+      const previous = this.currentBackend
+      await this.clients.unload(previous)
+      this.currentBackend = target
     }
   }
 
@@ -138,10 +131,21 @@ export class BackendGate {
         this.activeRequests += 1
         return this.releaseOnce()
       }
-      await this.transition(target)
-      // Reserve before yielding, so a waiting switch cannot overtake this call.
-      this.activeRequests += 1
-      return this.releaseOnce()
+      // Keep the transition lock held until this request owns a lease. If we
+      // wake competing waiters inside transition(), one could switch backends
+      // before this caller increments activeRequests.
+      this.transitioning = true
+      try {
+        await this.transition(target)
+        this.activeRequests += 1
+        this.transitioning = false
+        this.notify()
+        return this.releaseOnce()
+      } catch (error) {
+        this.transitioning = false
+        this.notify()
+        throw error
+      }
     }
   }
 
