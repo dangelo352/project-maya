@@ -1,4 +1,9 @@
-/** DSH 0.2.2-rc.5 llm/stream gate for the Maya and Qwen loopback servers. */
+/** DSH 0.2.2-rc.5 llm/stream gate for the local GPU model servers. */
+
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
 
 export const name = 'maya-backend-gate'
 export const inject = ['llm']
@@ -8,6 +13,8 @@ export const BACKENDS = Object.freeze({
   'maya-local-compact': 'maya',
   'hyperqwen-local': 'qwen',
   'hyperqwen-local-compact': 'qwen',
+  'hyperinkling-local': 'hyperinkling',
+  'hyperinkling-local-compact': 'hyperinkling',
   // The Qwen QoL adapter registers this provider by default. Keep it behind
   // the same single-GPU handoff as the profile's named HyperQwen routes.
   qwen38: 'qwen',
@@ -16,6 +23,7 @@ export const BACKENDS = Object.freeze({
 export const BACKEND_URLS = Object.freeze({
   maya: 'http://127.0.0.1:18022',
   qwen: 'http://127.0.0.1:18021',
+  hyperinkling: 'http://127.0.0.1:18023',
 })
 
 // Qwen may spend STOP_TIMEOUT_S terminating the CUDA process before replying.
@@ -42,21 +50,92 @@ function isQwenLoaded(status) {
   return Boolean(status?.engine_pid || status?.loading_model || status?.active_model)
 }
 
+function isConnectionError(error) {
+  return error instanceof TypeError && /fetch failed|failed to fetch/i.test(error.message)
+}
+
+async function startHyperInklingService({ distro, unit }) {
+  if (process.platform !== 'win32') {
+    throw new Error('automatic HyperInkling startup is configured for Windows + WSL only')
+  }
+  await execFileAsync('wsl.exe', ['-d', distro, '-u', 'root', '--', 'systemctl', 'start', unit], {
+    timeout: 60_000,
+    windowsHide: true,
+  })
+}
+
 export function createBackendClients({
   fetchImpl = globalThis.fetch,
   urls = BACKEND_URLS,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  startTimeoutMs = 900_000,
+  startService = startHyperInklingService,
+  distro = 'Ubuntu',
+  serviceUnit = 'hyperinkling.service',
+  pollIntervalMs = 2_000,
 } = {}) {
+  async function hyperinklingSleeping() {
+    const status = await requestJson(fetchImpl, `${urls.hyperinkling}/is_sleeping`, {}, timeoutMs)
+    if (typeof status?.is_sleeping !== 'boolean') {
+      throw new Error('HyperInkling /is_sleeping returned no boolean is_sleeping field')
+    }
+    return status.is_sleeping
+  }
+
+  async function waitForHyperInkling() {
+    const deadline = Date.now() + startTimeoutMs
+    let lastError
+    while (Date.now() < deadline) {
+      try {
+        return await hyperinklingSleeping()
+      } catch (error) {
+        if (!isConnectionError(error)) throw error
+        lastError = error
+      }
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs))
+    }
+    throw new Error(`HyperInkling did not become ready within ${startTimeoutMs} ms${lastError ? `: ${lastError.message}` : ''}`)
+  }
+
   return {
     async status(backend) {
-      const path = backend === 'maya' ? '/api/ps' : '/status'
+      const path = backend === 'maya' ? '/api/ps' : backend === 'hyperinkling' ? '/is_sleeping' : '/status'
       return requestJson(fetchImpl, `${urls[backend]}${path}`, {}, timeoutMs)
     },
     async loaded(backend) {
-      const status = await this.status(backend)
-      return backend === 'maya' ? isMayaLoaded(status) : isQwenLoaded(status)
+      let status
+      try {
+        status = await this.status(backend)
+      } catch (error) {
+        // HyperInkling is deliberately launched only when selected. An offline
+        // endpoint is an idle backend, not a reason to break Maya/Qwen routing.
+        if (backend === 'hyperinkling' && isConnectionError(error)) return false
+        throw error
+      }
+      if (backend === 'maya') return isMayaLoaded(status)
+      if (backend === 'hyperinkling') return status.is_sleeping === false
+      return isQwenLoaded(status)
+    },
+    async ensure(backend) {
+      if (backend !== 'hyperinkling') return
+      let sleeping
+      try {
+        sleeping = await hyperinklingSleeping()
+      } catch (error) {
+        if (!isConnectionError(error)) throw error
+        await startService({ distro, unit: serviceUnit })
+        sleeping = await waitForHyperInkling()
+      }
+      if (sleeping) {
+        await requestJson(fetchImpl, `${urls.hyperinkling}/wake_up`, { method: 'POST' }, timeoutMs)
+        if (await hyperinklingSleeping()) throw new Error('HyperInkling remained asleep after wake_up')
+      }
     },
     async unload(backend) {
+      if (backend === 'hyperinkling') {
+        await requestJson(fetchImpl, `${urls.hyperinkling}/sleep?level=1&mode=wait`, { method: 'POST' }, timeoutMs)
+        return { status: 'sleeping' }
+      }
       const path = backend === 'maya' ? '/models/unload' : '/unload'
       const body = backend === 'maya' ? {} : undefined
       const result = await requestJson(fetchImpl, `${urls[backend]}${path}`, {
@@ -101,13 +180,12 @@ export class BackendGate {
   }
 
   async reconcile(target) {
-    const [mayaLoaded, qwenLoaded] = await Promise.all([
-      this.clients.loaded('maya'),
-      this.clients.loaded('qwen'),
-    ])
-    const loaded = { maya: mayaLoaded, qwen: qwenLoaded }
-    const other = target === 'maya' ? 'qwen' : 'maya'
-    if (loaded[other]) await this.clients.unload(other)
+    const backends = Object.keys(BACKEND_URLS)
+    const states = await Promise.all(backends.map(async backend => [backend, await this.clients.loaded(backend)]))
+    for (const [backend, loaded] of states) {
+      if (backend !== target && loaded) await this.clients.unload(backend)
+    }
+    await this.clients.ensure?.(target)
     this.currentBackend = target
   }
 
@@ -117,6 +195,8 @@ export class BackendGate {
     } else {
       const previous = this.currentBackend
       await this.clients.unload(previous)
+      this.currentBackend = null
+      await this.clients.ensure?.(target)
       this.currentBackend = target
     }
   }

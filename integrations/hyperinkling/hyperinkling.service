@@ -1,0 +1,20 @@
+[Unit]
+Description=HyperInkling local vLLM server (started on demand by DSH)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/HyperInkling
+EnvironmentFile=/root/HyperInkling/.env
+Environment=PATH=/usr/local/cuda/bin:/root/HyperInkling/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/HyperInkling/start.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=120
+KillSignal=SIGTERM
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

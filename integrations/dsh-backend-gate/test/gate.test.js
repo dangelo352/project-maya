@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { BackendGate, BACKENDS } from '../lib/index.js'
+import { BackendGate, BACKENDS, createBackendClients } from '../lib/index.js'
 
 function deferred() {
   let resolve
@@ -29,6 +29,7 @@ test('same selected backend is a no-op and aliases map exactly', async () => {
   assert.deepEqual(BACKENDS, {
     'maya-local': 'maya', 'maya-local-compact': 'maya',
     'hyperqwen-local': 'qwen', 'hyperqwen-local-compact': 'qwen',
+    'hyperinkling-local': 'hyperinkling', 'hyperinkling-local-compact': 'hyperinkling',
     qwen38: 'qwen',
   })
 })
@@ -85,7 +86,9 @@ test('unknown bootstrap probes both endpoints and unloads loaded non-target', as
   })
   const gate = new BackendGate({ clients: io })
   const release = await gate.acquire('hyperqwen-local')
-  assert.deepEqual(io.calls, [['status', 'maya'], ['status', 'qwen'], ['unload', 'maya']])
+  assert.deepEqual(io.calls, [
+    ['status', 'maya'], ['status', 'qwen'], ['status', 'hyperinkling'], ['unload', 'maya'],
+  ])
   assert.equal(gate.currentBackend, 'qwen')
   release()
 })
@@ -96,7 +99,7 @@ test('unknown bootstrap retains target when it is already loaded', async () => {
   })
   const gate = new BackendGate({ clients: io })
   const release = await gate.acquire('maya-local')
-  assert.deepEqual(io.calls, [['status', 'maya'], ['status', 'qwen']])
+  assert.deepEqual(io.calls, [['status', 'maya'], ['status', 'qwen'], ['status', 'hyperinkling']])
   assert.equal(gate.currentBackend, 'maya')
   release()
 })
@@ -125,13 +128,73 @@ test('bootstrap reserves its backend before waking a competing switch', async ()
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(gate.currentBackend, 'maya')
   assert.equal(gate.activeRequests, 1)
-  assert.deepEqual(io.calls, [['status', 'maya'], ['status', 'qwen']])
+  assert.deepEqual(io.calls, [['status', 'maya'], ['status', 'qwen'], ['status', 'hyperinkling']])
 
   releaseMaya()
   const releaseQwen = await qwenRequest
   assert.deepEqual(io.calls, [
-    ['status', 'maya'], ['status', 'qwen'], ['unload', 'maya'],
+    ['status', 'maya'], ['status', 'qwen'], ['status', 'hyperinkling'], ['unload', 'maya'],
   ])
   assert.equal(gate.currentBackend, 'qwen')
   releaseQwen()
+})
+
+test('switching to HyperInkling unloads the old backend before starting it', async () => {
+  const io = clients({ ensure: async backend => { io.calls.push(['ensure', backend]) } })
+  const gate = new BackendGate({ clients: io })
+  gate.currentBackend = 'maya'
+  const release = await gate.acquire('hyperinkling-local')
+  assert.deepEqual(io.calls, [['unload', 'maya'], ['ensure', 'hyperinkling']])
+  assert.equal(gate.currentBackend, 'hyperinkling')
+  release()
+})
+
+test('offline HyperInkling is treated as idle during bootstrap', async () => {
+  const io = createBackendClients({ fetchImpl: async () => { throw new TypeError('fetch failed') } })
+  assert.equal(await io.loaded('hyperinkling'), false)
+})
+
+test('HyperInkling starts on demand and wakes when the API is ready', async () => {
+  let started = false
+  let sleeping = true
+  const calls = []
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([url, init.method ?? 'GET'])
+    if (!started) throw new TypeError('fetch failed')
+    if (url.endsWith('/is_sleeping')) {
+      return { ok: true, json: async () => ({ is_sleeping: sleeping }) }
+    }
+    if (url.endsWith('/wake_up')) {
+      sleeping = false
+      return { ok: true, json: async () => ({ status: 'awake' }) }
+    }
+    throw new Error(`unexpected URL ${url}`)
+  }
+  const io = createBackendClients({
+    fetchImpl,
+    startService: async ({ distro, unit }) => {
+      assert.equal(distro, 'Ubuntu')
+      assert.equal(unit, 'hyperinkling.service')
+      started = true
+    },
+    pollIntervalMs: 0,
+  })
+  await io.ensure('hyperinkling')
+  assert.equal(sleeping, false)
+  assert.deepEqual(calls.map(([url, method]) => [url.slice(url.lastIndexOf('/')), method]), [
+    ['/is_sleeping', 'GET'], ['/is_sleeping', 'GET'], ['/wake_up', 'POST'], ['/is_sleeping', 'GET'],
+  ])
+})
+
+test('HyperInkling level-1 sleep releases GPU weights and KV cache when switched away', async () => {
+  const calls = []
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([url, init.method ?? 'GET'])
+    return { ok: true, json: async () => ({ status: 'sleeping' }) }
+  }
+  const io = createBackendClients({ fetchImpl })
+  await io.unload('hyperinkling')
+  assert.deepEqual(calls, [
+    ['http://127.0.0.1:18023/sleep?level=1&mode=wait', 'POST'],
+  ])
 })
