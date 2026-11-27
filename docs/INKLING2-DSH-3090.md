@@ -107,7 +107,7 @@ Local checks on the active 3090 server:
 
 - A 214-token Python coding response completed at 236.0 tok/s with 165/230 draft tokens accepted. The previous base-model sample on the same short coding task was 231.5 tok/s; both are single samples and indicate comparable speed, not a guaranteed average.
 - The forced calculator tool call returned `calculator({"a":19,"b":23})` and the vision endpoint identified a generated blue square. `/health` reported 200,704 context and image support.
-- Four harmless direct-answer prompts produced no refusal. With reasoning set to medium and an artificial 256-token output cap, some short answers ended at the cap or had no final text; increasing the cap to 1,024 returned complete answers. DSH's configured output allowance is much higher, but short custom output caps can truncate this checkpoint's reasoning.
+- Four harmless direct-answer prompts produced no refusal. With reasoning set to medium and an artificial 256-token output cap, some short answers ended at the cap or had no final text; two rerun with a 1,024-token cap returned complete answers. DSH's configured output allowance is much higher, but short custom output caps can truncate this checkpoint's reasoning.
 
 The previous runtime config is preserved at `build/maya-dsh-200k.json.before-abliterated-20261126`. The model weights and runtime config are machine-local and are not committed to Git.
 
