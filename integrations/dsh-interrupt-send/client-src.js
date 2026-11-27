@@ -32,20 +32,23 @@ function hasDraft(input) {
   return Boolean(input && (input.draft?.trim() || input.attachmentIds?.length))
 }
 
-function buttonStyle(primary = false) {
+function buttonStyle() {
   return {
-    flex: '0 0 auto', border: '1px solid var(--border, rgba(150,160,180,.24))',
-    borderRadius: 9, minHeight: 30, padding: '5px 10px',
-    color: 'var(--fg, #ededed)',
-    background: primary ? 'var(--accent-soft, rgba(105,145,255,.16))' : 'var(--bg-soft, rgba(127,127,127,.1))',
-    cursor: 'pointer', font: 'inherit', fontSize: 11, fontWeight: 600,
+    display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 5,
+    flex: '0 0 auto', height: 28, padding: '0 8px', border: 'none',
+    borderRadius: 'var(--dsw-radius-sm, 8px)',
+    color: 'var(--dsw-alias-label-primary)', background: 'transparent',
+    fontFamily: 'var(--dsw-font-family)', fontSize: 13, lineHeight: '20px',
+    fontWeight: 500, whiteSpace: 'nowrap', transition: 'background-color 100ms ease',
   }
 }
 
 export function mount(React, slots, remoteSession, sessions) {
   const h = React.createElement
 
-  function BusyDraftActions({ session, input, inputActions }) {
+  function BusyDraftActions({ useSession, useInput, inputActions }) {
+    const session = useSession(value => value)
+    const input = useInput(value => value)
     const [busyAction, setBusyAction] = React.useState('')
     const [notice, setNotice] = React.useState('')
     const sessionRef = React.useRef(session)
@@ -139,30 +142,28 @@ export function mount(React, slots, remoteSession, sessions) {
 
     const disabled = !canSubmit || Boolean(busyAction)
     return h('div', {
-      'data-dsh-busy-draft-actions': '',
-      style: { display: 'flex', justifyContent: 'flex-end', alignItems: 'center', flexWrap: 'wrap', gap: 6, minHeight: 30, marginBottom: 6 },
+      'data-dsh-busy-draft-actions': '', role: 'group', 'aria-label': 'Message delivery',
+      style: { display: 'inline-flex', alignItems: 'center', flex: '0 0 auto', gap: 2 },
     },
-      notice ? h('span', {
-        role: 'status', 'aria-live': 'polite',
-        style: { maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--fg-muted, #9ca3af)', fontSize: 10 },
-      }, notice) : null,
+      h('style', null, `[data-dsh-busy-draft-actions] button:enabled{cursor:pointer}[data-dsh-busy-draft-actions] button:enabled:hover{background:var(--dsw-alias-interactive-bg-hover)}[data-dsh-busy-draft-actions] button:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}[data-dsh-busy-draft-actions] button:disabled{cursor:default;color:var(--dsw-alias-label-secondary)}@media(pointer:coarse){[data-dsh-busy-draft-actions] button{min-height:36px}}`),
+      notice ? h('span', { role: 'status', 'aria-live': 'polite', style: { position: 'absolute', width: 1, height: 1, overflow: 'hidden', clipPath: 'inset(50%)' } }, notice) : null,
       h('button', {
         type: 'button', onClick: steer, disabled: disabled || !canSteer,
         title: canSteer
           ? 'Send this text into the current turn; it is picked up at the next step boundary.'
           : 'Steer supports plain text only. Use Override for attachments, references, or slash commands.',
-        style: { ...buttonStyle(false), opacity: disabled || !canSteer ? .48 : 1 },
+        style: buttonStyle(),
       }, busyAction === 'steer' ? 'Steering…' : 'Steer'),
       h('button', {
         type: 'button', onClick: override, disabled,
         title: 'Stop the current turn, wait for DSH to become idle, then send the full composer draft as a new turn.',
-        style: { ...buttonStyle(true), opacity: disabled ? .55 : 1 },
+        style: buttonStyle(),
       }, busyAction === 'override' ? 'Overriding…' : 'Override'),
     )
   }
 
-  slots.inject('conversation.input.dock', () => slots.register({
-    name: 'conversation.input.dock',
+  slots.inject('conversation.input.right', () => slots.register({
+    name: 'conversation.input.right',
     id: 'dsh-busy-draft-actions',
     order: 100,
     label: 'Steer the active turn or stop it and send a new turn',
