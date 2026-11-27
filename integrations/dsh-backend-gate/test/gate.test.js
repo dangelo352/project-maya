@@ -1,6 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { BackendGate, BACKENDS, createBackendClients } from '../lib/index.js'
+import {
+  BackendGate, BACKENDS, createBackendClients, createSwitchStatusHandler,
+  summarizeBackendStatus,
+} from '../lib/index.js'
 
 function deferred() {
   let resolve
@@ -53,6 +56,62 @@ test('same backend requests overlap without unloading', async () => {
   assert.equal(gate.activeRequests, 2)
   a(); b()
   assert.deepEqual(io.calls, [])
+})
+
+test('gate tracks the exact active session IDs that block a switch', async () => {
+  const io = clients({ unload: async backend => { io.calls.push(['unload', backend]) } })
+  const gate = new BackendGate({ clients: io })
+  gate.currentBackend = 'maya'
+  const release = await gate.acquire('maya-local', 'session-a')
+  const switching = gate.selectModel({ provider: 'hyperqwen-local', model: 'qwen3.8-27b', sessionId: 'session-b' })
+  await new Promise(resolve => setImmediate(resolve))
+  const status = await gate.statusSnapshot()
+  assert.equal(status.phase, 'waiting-for-active-request')
+  assert.deepEqual(status.blockingSessionIds, ['session-a'])
+  release()
+  await switching
+  assert.equal(gate.currentBackend, 'qwen')
+  assert.equal((await gate.statusSnapshot()).phase, 'ready')
+})
+
+test('request leases preserve transition correctness without a model-selection revision', async () => {
+  const gate = new BackendGate({ clients: clients() })
+  gate.currentBackend = 'maya'
+  const release = await gate.acquire('hyperqwen-local', 'session-q')
+  assert.equal(gate.currentBackend, 'qwen')
+  assert.equal(gate.activeSessions.get('session-q'), 1)
+  release()
+  assert.equal(gate.activeSessions.has('session-q'), false)
+})
+
+test('native status summaries report backend facts without inventing percentages', () => {
+  assert.deepEqual(summarizeBackendStatus('maya', { status: 'ok', model: 'inkling-2-mini', unloaded: true }), {
+    state: 'unloaded', model: 'inkling-2-mini', version: null, unloaded: true,
+  })
+  assert.deepEqual(summarizeBackendStatus('qwen', { loading_model: 'qwen3.8-27b', engine_pid: null }), {
+    state: 'loading', model: 'qwen3.8-27b', loading: true, engine: false, error: null,
+  })
+  assert.deepEqual(summarizeBackendStatus('qwen', { active_model: 'qwen3.8-27b', engine_pid: 123 }), {
+    state: 'ready', model: 'qwen3.8-27b', loading: false, engine: true, error: null,
+  })
+})
+
+test('switch status endpoint is no-store and session scoped', async () => {
+  const gate = new BackendGate({ clients: clients({ status: async () => ({ status: 'ok', unloaded: false }) }) })
+  gate.switchStatus = {
+    sessionId: 'session-a', provider: 'maya-local', model: 'inkling-2-mini', backend: 'maya',
+    phase: 'ready', startedAt: Date.now(), updatedAt: Date.now(), finishedAt: Date.now(),
+  }
+  const handler = createSwitchStatusHandler(gate)
+  const wrong = await handler(new Request('http://local/api/dsh-model-switch-status?sessionId=session-b'))
+  assert.equal(wrong.headers.get('cache-control'), 'no-store')
+  assert.equal(await wrong.json(), null)
+  const right = await handler(new Request('http://local/api/dsh-model-switch-status?sessionId=session-a'))
+  assert.equal((await right.json()).sessionId, 'session-a')
+  const badQuery = await handler(new Request('http://local/api/dsh-model-switch-status?other=x'))
+  assert.equal(badQuery.status, 400)
+  const badMethod = await handler(new Request('http://local/api/dsh-model-switch-status', { method: 'POST' }))
+  assert.equal(badMethod.status, 405)
 })
 
 test('idle selected backend is rechecked before the next request', async () => {
@@ -206,6 +265,31 @@ test('Maya reloads its model if the server is alive but the model was unloaded',
   assert.equal(loaded, true)
   assert.deepEqual(calls.map(([url, method]) => [url.slice(url.lastIndexOf('/')), method]), [
     ['/health', 'GET'], ['/load', 'POST'], ['/health', 'GET'],
+  ])
+})
+
+test('Qwen selection calls the router load endpoint and waits for backend readiness', async () => {
+  let loaded = false
+  const calls = []
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([url, init.method ?? 'GET'])
+    if (url.endsWith('/status')) return {
+      ok: true,
+      json: async () => loaded
+        ? { active_model: 'qwen3.8-27b', loading_model: null, engine_pid: 4242, last_error: null }
+        : { active_model: null, loading_model: null, engine_pid: null, last_error: null },
+    }
+    if (url.endsWith('/load')) {
+      assert.deepEqual(JSON.parse(init.body), { model: 'qwen3.8-27b' })
+      loaded = true
+      return { ok: true, json: async () => ({ ok: true, status: 'ready' }) }
+    }
+    throw new Error(`unexpected URL ${url}`)
+  }
+  const io = createBackendClients({ fetchImpl, pollIntervalMs: 0 })
+  await io.ensure('qwen', 'qwen3.8-27b')
+  assert.deepEqual(calls.map(([url, method]) => [url.slice(url.lastIndexOf('/')), method]), [
+    ['/status', 'GET'], ['/load', 'POST'], ['/status', 'GET'],
   ])
 })
 
