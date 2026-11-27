@@ -1,13 +1,12 @@
-# DSH Interrupt & Send
+# DSH Steer and Override
 
-Adds an explicit **Stop & send now** action while a DeepSeek Harness session is running and the composer contains a draft.
+Adds compact **Steer** and **Override** actions to the active-session composer in the desktop DSH profile. The controls are model-agnostic and appear while a turn is running and the composer has a draft.
 
-The action saves the draft, requests DSH's normal session cancellation, waits for the selected session to report idle, then submits the latest composer contents through DSH's regular input API. That preserves the normal handling of slash commands, references, and uploaded attachment receipts. A double-click cannot submit twice. If cancellation fails, the session changes, the composer becomes invalid, or DSH does not become idle within two minutes, the action reports the problem and leaves the draft in place.
+- **Steer** sends plain text through DSH's session controller with delivery mode `steer`. DSH accepts it into the active turn at a step boundary; a currently running tool must finish first. Attachments, reference chips, and slash commands are disabled for this action so the plugin cannot silently flatten or drop structured input.
+- **Override** persists the full draft, cancels the current turn, waits for the selected session to remain idle, then submits once through the regular composer action. That preserves normal slash-command, reference, and attachment handling.
 
-This is intentionally an explicit third action. Ordinary Queue and Steer keep their existing meanings. DSH Steer is consumed at a step boundary, so it cannot interrupt a long model request or blocking tool call. Already-running external side effects are not rolled back by cancellation.
+Both controls use DSH's own session and composer APIs. No app.asar patch or model-server change is involved. The two actions are guarded against double submission; errors leave the draft in the composer.
 
-The extension occupies the built-in `conversation.input.dock` slot and uses the public client `remote.session.cancel`, `inputActions.persistDraft`, and `inputActions.submit` APIs. No app.asar patch or model-server change is required.
+## Build and install
 
-## Build
-
-Run `npm run bundle:client` from this directory, then add this package to the desktop profile dependencies and bundle list. Restart DSH to load the client module.
+Run `npm run bundle:client` from this directory. The desktop profile includes this package in its bundle list; restart DSH to load an updated browser bundle.

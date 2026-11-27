@@ -72,33 +72,81 @@ async function waitForIdle(readSession, sessionId, options = {}) {
 function hasDraft(input) {
   return Boolean(input && (input.draft?.trim() || input.attachmentIds?.length));
 }
-function mount(React2, slots, remoteSession) {
+function buttonStyle(primary = false) {
+  return {
+    flex: "0 0 auto",
+    border: "1px solid var(--border, rgba(150,160,180,.24))",
+    borderRadius: 9,
+    minHeight: 30,
+    padding: "5px 10px",
+    color: "var(--fg, #ededed)",
+    background: primary ? "var(--accent-soft, rgba(105,145,255,.16))" : "var(--bg-soft, rgba(127,127,127,.1))",
+    cursor: "pointer",
+    font: "inherit",
+    fontSize: 11,
+    fontWeight: 600
+  };
+}
+function mount(React2, slots, remoteSession, sessions) {
   const h = React2.createElement;
-  function InterruptSend({ session, input, inputActions }) {
-    const [phase, setPhase] = React2.useState("idle");
-    const [message, setMessage] = React2.useState("");
+  function BusyDraftActions({ session, input, inputActions }) {
+    const [busyAction, setBusyAction] = React2.useState("");
+    const [notice, setNotice] = React2.useState("");
     const sessionRef = React2.useRef(session);
     const inputRef = React2.useRef(input);
     const actionsRef = React2.useRef(inputActions);
-    const operationRef = React2.useRef(false);
-    const mountedRef = React2.useRef(true);
+    const actionRef = React2.useRef(false);
     sessionRef.current = session;
     inputRef.current = input;
     actionsRef.current = inputActions;
-    React2.useEffect(() => {
-      mountedRef.current = true;
-      return () => {
-        mountedRef.current = false;
-      };
-    }, []);
-    const canSubmit = hasDraft(input) && ["plain", "claimed"].includes(input?.phase) && typeof inputActions?.persistDraft === "function" && typeof inputActions?.submit === "function";
-    const visible = Boolean(session?.running && canSubmit) || phase === "stopping";
-    const interruptAndSend = async () => {
-      if (operationRef.current || !session?.sessionId || !canSubmit || typeof remoteSession?.cancel !== "function") return;
-      const sessionId = session.sessionId;
-      operationRef.current = true;
-      setPhase("stopping");
-      setMessage("Saving your draft and stopping the active turn\u2026");
+    const sessionId = session?.sessionId;
+    const canSubmit = Boolean(session?.running && sessionId && hasDraft(input) && ["plain", "claimed"].includes(input?.phase) && typeof inputActions?.persistDraft === "function" && typeof inputActions?.submit === "function");
+    if (!canSubmit && !busyAction) return null;
+    const draft = input?.draft?.trim() || "";
+    const canSteer = canSubmit && Boolean(draft) && input?.attachmentIds?.length === 0 && input?.occurrences?.length === 0 && !input?.claim && !draft.startsWith("/") && typeof sessions?.binding === "function";
+    const steer = async () => {
+      if (actionRef.current || !canSteer) return;
+      actionRef.current = true;
+      setBusyAction("steer");
+      setNotice("");
+      try {
+        const before = sessionRef.current;
+        const text = inputRef.current?.draft?.trim();
+        if (!before?.running || before.sessionId !== sessionId || !text) {
+          throw new Error("The active turn or draft changed. Nothing was sent.");
+        }
+        actionsRef.current.persistDraft();
+        const binding = sessions.binding(sessionId);
+        if (!binding?.session?.prompt || !binding.session.beginSubmission) {
+          throw new Error("DSH could not access the active session. Your draft is still saved.");
+        }
+        const submission = binding.session.beginSubmission({ mode: "steer", text, attachments: [] });
+        const result = await binding.session.prompt(
+          [{ type: "text", text }],
+          "steer",
+          void 0,
+          submission.requestId
+        );
+        if (!result?.ok) throw new Error(result?.error?.message || "DSH did not accept the steer.");
+        const latest = sessionRef.current;
+        const latestInput = inputRef.current;
+        if (latest?.sessionId !== sessionId || latestInput?.draft?.trim() !== text) {
+          throw new Error("The steer was accepted, but the composer changed before it could be cleared. Check the conversation before resending.");
+        }
+        actionsRef.current.setDraft("");
+        setNotice("Steer accepted \xB7 takes effect at the next step boundary.");
+      } catch (error) {
+        setNotice(error?.message || "Steer failed; your draft remains in the composer.");
+      } finally {
+        actionRef.current = false;
+        setBusyAction("");
+      }
+    };
+    const override = async () => {
+      if (actionRef.current || !canSubmit || typeof remoteSession?.cancel !== "function") return;
+      actionRef.current = true;
+      setBusyAction("override");
+      setNotice("Saving draft and stopping the active turn\u2026");
       try {
         actionsRef.current.persistDraft();
         const result = await remoteSession.cancel({ sessionId });
@@ -108,81 +156,63 @@ function mount(React2, slots, remoteSession) {
         await waitForIdle(() => sessionRef.current, sessionId);
         const latestSession = sessionRef.current;
         const latestInput = inputRef.current;
-        const latestActions = actionsRef.current;
         if (latestSession?.sessionId !== sessionId || latestSession.running) {
-          throw new Error("The session started again before your message could be sent. Your draft is still saved.");
+          throw new Error("The session started again before the draft could be sent. Your draft is still saved.");
         }
         if (!hasDraft(latestInput) || !["plain", "claimed"].includes(latestInput?.phase)) {
           throw new Error("The composer changed while DSH was stopping. Your draft is still saved.");
         }
-        latestActions.submit();
-        setPhase("sent");
-        setMessage("Stopped the previous turn and sent the latest draft.");
+        actionsRef.current.submit();
+        setNotice("Previous turn stopped \xB7 latest draft sent as a new turn.");
       } catch (error) {
-        setPhase("error");
-        setMessage(error?.message || "Could not stop and send. Your draft remains in the composer.");
+        setNotice(error?.message || "Override failed; your draft remains in the composer.");
       } finally {
-        operationRef.current = false;
+        actionRef.current = false;
+        setBusyAction("");
       }
     };
-    if (!visible) return null;
-    const busy = phase === "stopping";
-    const tone = phase === "error" ? "var(--danger, #ef6262)" : "var(--fg-muted, #a4aab6)";
+    const disabled = !canSubmit || Boolean(busyAction);
     return h(
-      "section",
+      "div",
       {
-        "data-dsh-interrupt-send": phase,
-        style: {
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 10,
-          margin: "0 0 7px",
-          padding: "7px 10px",
-          border: "1px solid var(--border, rgba(150,160,180,.2))",
-          borderRadius: 11,
-          background: "var(--bg-soft, rgba(127,127,127,.08))"
-        }
+        "data-dsh-busy-draft-actions": "",
+        style: { display: "flex", alignItems: "center", gap: 6, minHeight: 30 }
       },
-      h("span", {
-        role: phase === "error" ? "alert" : "status",
+      notice ? h("span", {
+        role: "status",
         "aria-live": "polite",
-        style: { minWidth: 0, fontSize: 11, lineHeight: 1.4, color: tone }
-      }, message || "Stop this turn and deliver the current draft as a new turn."),
+        style: { maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--fg-muted, #9ca3af)", fontSize: 10 }
+      }, notice) : null,
       h("button", {
         type: "button",
-        onClick: interruptAndSend,
-        disabled: busy || !canSubmit,
-        title: "Cancel the current turn, wait until DSH is idle, then send the latest composer draft once.",
-        style: {
-          flex: "0 0 auto",
-          border: "1px solid var(--border, rgba(150,160,180,.28))",
-          borderRadius: 9,
-          padding: "7px 10px",
-          color: "var(--fg, #ededed)",
-          background: "var(--bg, rgba(40,40,45,.8))",
-          cursor: busy ? "wait" : "pointer",
-          opacity: busy || !canSubmit ? 0.6 : 1,
-          fontSize: 11,
-          fontWeight: 600
-        }
-      }, busy ? "Stopping\u2026" : phase === "error" ? "Retry stop & send" : "Stop & send now")
+        onClick: steer,
+        disabled: disabled || !canSteer,
+        title: canSteer ? "Send this text into the current turn; it is picked up at the next step boundary." : "Steer supports plain text only. Use Override for attachments, references, or slash commands.",
+        style: { ...buttonStyle(false), opacity: disabled || !canSteer ? 0.48 : 1 }
+      }, busyAction === "steer" ? "Steering\u2026" : "Steer"),
+      h("button", {
+        type: "button",
+        onClick: override,
+        disabled,
+        title: "Stop the current turn, wait for DSH to become idle, then send the full composer draft as a new turn.",
+        style: { ...buttonStyle(true), opacity: disabled ? 0.55 : 1 }
+      }, busyAction === "override" ? "Overriding\u2026" : "Override")
     );
   }
   slots.inject("conversation.input.dock", () => slots.register({
     name: "conversation.input.dock",
-    id: "dsh-interrupt-send",
+    id: "dsh-busy-draft-actions",
     order: 100,
-    label: "Interrupt the active turn and send the latest draft"
-  }, InterruptSend));
+    label: "Steer the active turn or stop it and send a new turn"
+  }, BusyDraftActions));
 }
 
 // client-entry.js
 var name = "dsh-interrupt-send";
-var inject = ["slots", "remote.session"];
+var inject = ["slots", "remote.session", "sessions"];
 function apply(ctx) {
-  ctx.inject(["slots", "remote.session"], (clientCtx) => {
-    mount(import_react.default, clientCtx.slots, clientCtx.remote.session);
+  ctx.inject(["slots", "remote.session", "sessions"], (clientCtx) => {
+    mount(import_react.default, clientCtx.slots, clientCtx.remote.session, clientCtx.sessions);
   });
 }
 var client_entry_default = apply;
