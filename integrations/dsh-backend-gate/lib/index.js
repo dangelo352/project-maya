@@ -1,5 +1,6 @@
 /** DSH 0.2.2-rc.5 llm/stream gate for the local GPU model servers. */
 
+import { spawn } from 'node:child_process'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
@@ -43,7 +44,7 @@ async function requestJson(fetchImpl, url, init = {}, timeoutMs = DEFAULT_TIMEOU
 }
 
 function isMayaLoaded(status) {
-  return Boolean(status?.models?.length || status?.loading)
+  return status?.status === 'ok' && status?.unloaded !== true
 }
 
 function isQwenLoaded(status) {
@@ -78,6 +79,23 @@ async function stopHyperInklingService({ distro, unit }) {
   })
 }
 
+function startMayaProcess({ python, cwd, config, host, port }) {
+  if (process.platform !== 'win32') {
+    throw new Error('automatic Maya startup is configured for this Windows installation')
+  }
+  const child = spawn(python, [
+    '-u', 'serve/server.py', '--engine', 'maya', '--config', config,
+    '--host', host, '--port', String(port),
+  ], { cwd, detached: true, stdio: 'ignore', windowsHide: true })
+  return new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('spawn', () => {
+      child.unref()
+      resolve()
+    })
+  })
+}
+
 export function createBackendClients({
   fetchImpl = globalThis.fetch,
   urls = BACKEND_URLS,
@@ -87,6 +105,12 @@ export function createBackendClients({
   stopService = stopHyperInklingService,
   distro = 'Ubuntu',
   serviceUnit = 'hyperinkling.service',
+  startMaya = startMayaProcess,
+  mayaPython = 'E:\\Project-Maya\\.venv\\Scripts\\python.exe',
+  mayaCwd = 'E:\\Project-Maya',
+  mayaConfig = 'build/maya-dsh-200k.json',
+  mayaHost = '127.0.0.1',
+  mayaPort = 18022,
   pollIntervalMs = 2_000,
 } = {}) {
   async function hyperinklingState() {
@@ -121,10 +145,26 @@ export function createBackendClients({
     throw new Error(`HyperInkling did not become ready within ${startTimeoutMs} ms${lastError ? `: ${lastError.message}` : ''}`)
   }
 
+  async function waitForMaya() {
+    const deadline = Date.now() + startTimeoutMs
+    let lastError
+    while (Date.now() < deadline) {
+      try {
+        const health = await requestJson(fetchImpl, `${urls.maya}/health`, {}, timeoutMs)
+        if (health?.status === 'ok' && health?.unloaded !== true) return health
+      } catch (error) {
+        if (!isConnectionError(error) && !isTransientHttpError(error)) throw error
+        lastError = error
+      }
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs))
+    }
+    throw new Error(`Maya did not become ready within ${startTimeoutMs} ms${lastError ? `: ${lastError.message}` : ''}`)
+  }
+
   return {
     async status(backend) {
       if (backend === 'hyperinkling') return hyperinklingState()
-      const path = backend === 'maya' ? '/api/ps' : '/status'
+      const path = backend === 'maya' ? '/health' : '/status'
       return requestJson(fetchImpl, `${urls[backend]}${path}`, {}, timeoutMs)
     },
     async loaded(backend) {
@@ -132,9 +172,9 @@ export function createBackendClients({
       try {
         status = await this.status(backend)
       } catch (error) {
-        // HyperInkling is deliberately launched only when selected. An offline
-        // endpoint is an idle backend, not a reason to break Maya/Qwen routing.
-        if (backend === 'hyperinkling' && isConnectionError(error)) return false
+        // Local backends may be stopped between sessions. Treat a refused
+        // connection as idle so bootstrap can still route to another model.
+        if (isConnectionError(error)) return false
         throw error
       }
       if (backend === 'maya') return isMayaLoaded(status)
@@ -142,6 +182,22 @@ export function createBackendClients({
       return isQwenLoaded(status)
     },
     async ensure(backend) {
+      if (backend === 'maya') {
+        try {
+          const health = await requestJson(fetchImpl, `${urls.maya}/health`, {}, timeoutMs)
+          if (health?.status === 'ok' && health?.unloaded !== true) return
+          if (health?.status !== 'ok') throw new Error('Maya /health did not report status=ok')
+          await requestJson(fetchImpl, `${urls.maya}/models/load`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model: 'inkling-2-mini' }),
+          }, timeoutMs)
+        } catch (error) {
+          if (!isConnectionError(error)) throw error
+          await startMaya({ python: mayaPython, cwd: mayaCwd, config: mayaConfig, host: mayaHost, port: mayaPort })
+        }
+        await waitForMaya()
+        return
+      }
       if (backend !== 'hyperinkling') return
       let sleeping
       try {
@@ -172,10 +228,16 @@ export function createBackendClients({
       }
       const path = backend === 'maya' ? '/models/unload' : '/unload'
       const body = backend === 'maya' ? {} : undefined
-      const result = await requestJson(fetchImpl, `${urls[backend]}${path}`, {
-        method: 'POST',
-        ...(body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
-      }, timeoutMs)
+      let result
+      try {
+        result = await requestJson(fetchImpl, `${urls[backend]}${path}`, {
+          method: 'POST',
+          ...(body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+        }, timeoutMs)
+      } catch (error) {
+        if (backend === 'maya' && isConnectionError(error)) return { status: 'stopped' }
+        throw error
+      }
       const state = result?.status?.value ?? result?.status
       if (result?.ok === false || result?.busy === true || state === 'busy' || state === 'error') {
         throw new Error(`${backend} unload failed: ${result.message ?? state ?? 'backend reported failure'}`)
@@ -244,7 +306,7 @@ export class BackendGate {
         await this.waitForChange()
         continue
       }
-      if (this.currentBackend === target) {
+      if (this.currentBackend === target && this.activeRequests > 0) {
         this.activeRequests += 1
         return this.releaseOnce()
       }
@@ -253,7 +315,8 @@ export class BackendGate {
       // before this caller increments activeRequests.
       this.transitioning = true
       try {
-        await this.transition(target)
+        if (this.currentBackend === target) await this.clients.ensure?.(target)
+        else await this.transition(target)
         this.activeRequests += 1
         this.transitioning = false
         this.notify()

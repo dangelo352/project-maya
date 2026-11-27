@@ -55,6 +55,15 @@ test('same backend requests overlap without unloading', async () => {
   assert.deepEqual(io.calls, [])
 })
 
+test('idle selected backend is rechecked before the next request', async () => {
+  const io = clients({ ensure: async backend => { io.calls.push(['ensure', backend]) } })
+  const gate = new BackendGate({ clients: io })
+  gate.currentBackend = 'maya'
+  const release = await gate.acquire('maya-local')
+  assert.deepEqual(io.calls, [['ensure', 'maya']])
+  release()
+})
+
 test('backend switch waits for active calls to drain before unloading', async () => {
   const started = deferred()
   const io = clients({ unload: async backend => { io.calls.push(['unload', backend]); return { status: 'unloaded' } } })
@@ -152,6 +161,57 @@ test('switching to HyperInkling unloads the old backend before starting it', asy
 test('offline HyperInkling is treated as idle during bootstrap', async () => {
   const io = createBackendClients({ fetchImpl: async () => { throw new TypeError('fetch failed') } })
   assert.equal(await io.loaded('hyperinkling'), false)
+})
+
+test('offline Maya is treated as idle and can be started on demand', async () => {
+  let started = false
+  const calls = []
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([url, init.method ?? 'GET'])
+    if (!started) throw new TypeError('fetch failed')
+    return { ok: true, json: async () => ({ status: 'ok', unloaded: false }) }
+  }
+  const io = createBackendClients({
+    fetchImpl,
+    startMaya: async config => {
+      assert.equal(config.python, 'python.exe')
+      assert.equal(config.cwd, 'E:/Project-Maya')
+      started = true
+    },
+    mayaPython: 'python.exe',
+    mayaCwd: 'E:/Project-Maya',
+    pollIntervalMs: 0,
+  })
+
+  assert.equal(await io.loaded('maya'), false)
+  await io.ensure('maya')
+  assert.equal(started, true)
+  assert.equal(calls.filter(([url]) => url.endsWith('/health')).length, 3)
+})
+
+test('Maya reloads its model if the server is alive but the model was unloaded', async () => {
+  let loaded = false
+  const calls = []
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([url, init.method ?? 'GET'])
+    if (url.endsWith('/health')) return { ok: true, json: async () => ({ status: 'ok', unloaded: !loaded }) }
+    if (url.endsWith('/models/load')) {
+      loaded = true
+      return { ok: true, json: async () => ({ status: { value: 'loaded' } }) }
+    }
+    throw new Error(`unexpected URL ${url}`)
+  }
+  const io = createBackendClients({ fetchImpl })
+  await io.ensure('maya')
+  assert.equal(loaded, true)
+  assert.deepEqual(calls.map(([url, method]) => [url.slice(url.lastIndexOf('/')), method]), [
+    ['/health', 'GET'], ['/load', 'POST'], ['/health', 'GET'],
+  ])
+})
+
+test('stopping an already-offline Maya backend does not block model switching', async () => {
+  const io = createBackendClients({ fetchImpl: async () => { throw new TypeError('fetch failed') } })
+  assert.deepEqual(await io.unload('maya'), { status: 'stopped' })
 })
 
 test('HyperInkling starts on demand and wakes when the API is ready', async () => {
