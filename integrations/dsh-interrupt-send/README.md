@@ -12,3 +12,7 @@ Both controls use DSH's own session and composer APIs. No app.asar patch or mode
 Run `npm run bundle:client` from this directory. The desktop profile includes this package in its bundle list; restart DSH to load an updated browser bundle.
 
 Action acknowledgements and errors appear beside the buttons. `node --test test/buttons.test.js` checks duplicate-click exclusion, failed-turn input, cancellation refusal, and auto-goal cancellation races.
+
+## Queued messages
+
+An interactive queue strip replaces the built-in queue presentation while pending messages exist. It uses the Host inbox projection and preserves native message IDs. Each user-authored row offers Edit (plain text only), Steer, Send now (promote then request cancellation), and Remove. Attachments remain Host-owned and are never copied into a second prompt. Uploads awaiting Host admission appear as Sending with no mutation controls. Queue mutations surface errors when the item has already been consumed; a failed promotion never cancels unrelated work. The Host still owns step-boundary steering and cancellation timing.

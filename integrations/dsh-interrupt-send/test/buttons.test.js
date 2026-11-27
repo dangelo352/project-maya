@@ -53,3 +53,29 @@ test('failed turn permits both buttons and refused cancellation retains the draf
   assert.equal(denied.input.draft,'LATEST_MESSAGE')
   assert.equal(denied.calls.some(x=>Array.isArray(x)&&x[0]==='prompt'),false)
 })
+
+import { promoteQueuedMessage } from '../client-src.js'
+
+test('queued steer promotes the existing message ID without copying attachments', async()=>{
+  const calls=[]
+  await promoteQueuedMessage({
+    updateQueue: async(id,action)=>{calls.push([id,action]);return {ok:true}},
+    cancel: async()=>{throw new Error('steer must not cancel')},
+    prompt: async()=>{throw new Error('queued messages must never be resent')},
+  },'queued-attachment-message')
+  assert.deepEqual(calls,[['queued-attachment-message',{kind:'steer'}]])
+})
+test('queued Send now promotes the existing item then requests stop',async()=>{
+  const calls=[]
+  await promoteQueuedMessage({
+    updateQueue:async(id,action)=>{calls.push(['promote',id,action.kind]);return {ok:true}},
+    cancel:async()=>{calls.push(['cancel']);return {ok:true}},
+  },'queued-two',true)
+  assert.deepEqual(calls,[['promote','queued-two','steer'],['cancel']])
+})
+test('a queue item already consumed cannot cancel unrelated work',async()=>{
+  await assert.rejects(promoteQueuedMessage({
+    updateQueue:async()=>({ok:false,error:{message:'item no longer pending'}}),
+    cancel:async()=>{throw new Error('must not cancel when promotion fails')},
+  },'old-item',true),/no longer pending/)
+})

@@ -93,6 +93,14 @@ function buttonStyle() {
     transition: "background-color 100ms ease"
   };
 }
+async function promoteQueuedMessage(face, itemId, interrupt = false) {
+  const result = await face.updateQueue(itemId, { kind: "steer" });
+  if (!result?.ok) throw new Error(result?.error?.message || "The queued message could not be steered.");
+  if (interrupt) {
+    const stopped = await face.cancel();
+    if (!stopped?.ok) throw new Error(stopped?.error?.message || "Message was steered, but DSH could not stop the current step.");
+  }
+}
 function mount(React2, slots, remoteSession, sessions) {
   const h = React2.createElement;
   function BusyDraftActions({ useSession, useInput, inputActions }) {
@@ -215,6 +223,95 @@ function mount(React2, slots, remoteSession, sessions) {
       }, busyAction === "override" ? "Overriding\u2026" : "Override")
     );
   }
+  function QueuedMessages({ sessionId, useSession, useProjection }) {
+    const running = useSession((value) => value.running);
+    const pending = useSession((value) => value.pendingSubmissions || []);
+    const inbox = useProjection("inbox");
+    const queue = inbox?.["next-turn"] || [];
+    const [busy, setBusy] = React2.useState(null);
+    const [notice, setNotice] = React2.useState("");
+    const [editing, setEditing] = React2.useState(null);
+    const locked = React2.useRef(false);
+    const admitted = new Set(queue.map((row) => row.source?.rpcId).filter(Boolean));
+    const sending = pending.filter((row) => row.placement === "queued" && !admitted.has(row.requestId));
+    if (!queue.length && !sending.length) return null;
+    const action = async (row, kind, content) => {
+      if (locked.current) return;
+      const face = sessions.binding(sessionId)?.session;
+      if (!face) {
+        setNotice("This session is no longer available.");
+        return;
+      }
+      locked.current = true;
+      setBusy(row.id);
+      setNotice("");
+      try {
+        if (kind === "steer" || kind === "override") {
+          await promoteQueuedMessage(face, row.id, kind === "override");
+          setNotice(kind === "override" ? "Queued message sent now; current step stopped." : "Queued message will be read after the current step.");
+        } else {
+          const result = await face.updateQueue(row.id, kind === "edit" ? { kind: "edit", content: [{ type: "text", text: content }] } : { kind: "remove" });
+          if (!result?.ok) throw new Error(result?.error?.message || "Queue update failed.");
+          setEditing(null);
+        }
+      } catch (error) {
+        setNotice(error?.message || "Queue action failed. Check the message before retrying.");
+      } finally {
+        locked.current = false;
+        setBusy(null);
+      }
+    };
+    const control = (label, title, onClick, disabled) => h("button", {
+      type: "button",
+      title,
+      "aria-label": title,
+      onClick,
+      disabled,
+      style: { ...buttonStyle(), color: "var(--dsw-alias-label-primary)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.65 : 1 }
+    }, label);
+    return h(
+      "section",
+      {
+        "data-dsh-queued-actions": "",
+        "aria-label": "Queued messages",
+        style: { width: "100%", maxWidth: "var(--dsh-composer-card-max-width)", boxSizing: "border-box", margin: "0 auto 6px", padding: "6px 8px", borderRadius: "var(--dsw-radius-md, 12px)", background: "var(--dsw-specific-input-major)", border: "1px solid var(--dsw-alias-border-l2)", fontFamily: "var(--dsw-font-family)", color: "var(--dsw-alias-label-primary)" }
+      },
+      h("style", null, "[data-queue-dock]{display:none!important}[data-dsh-queued-actions] button:enabled:hover{background:var(--dsw-alias-interactive-bg-hover)}[data-dsh-queued-actions] button:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary)}[data-dsh-queued-actions] .dsh-queued-row{display:flex;align-items:center;gap:6px;min-height:32px;flex-wrap:wrap}[data-dsh-queued-actions] .dsh-queued-preview{flex:1 1 120px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;padding:0 4px}"),
+      h("div", { style: { fontSize: 11, color: "var(--dsw-alias-label-secondary)", padding: "0 4px 3px" } }, `${queue.length + sending.length} queued`),
+      ...queue.map((row) => {
+        const content = row.content || [];
+        const text = content.filter((block) => block.type === "text").map((block) => block.text).join("");
+        const attachments = content.filter((block) => block.type !== "text").length;
+        const mutable = row.source?.kind === "user";
+        return h(
+          "div",
+          { key: row.id, className: "dsh-queued-row" },
+          editing?.id === row.id ? h("input", { "aria-label": "Edit queued message", value: editing.text, onChange: (event) => setEditing({ id: row.id, text: event.target.value }), style: { flex: "1 1 180px", minWidth: 80, padding: "5px 8px", font: "inherit", fontSize: 13, border: "1px solid var(--dsw-alias-border-l2)", borderRadius: 6, color: "var(--dsw-alias-label-primary)", background: "var(--dsw-specific-input-major)" } }) : h("span", { className: "dsh-queued-preview", title: text }, `${text || "Attached message"}${attachments ? ` (${attachments} attachment${attachments === 1 ? "" : "s"})` : ""}`),
+          editing?.id === row.id ? h(
+            React2.Fragment,
+            null,
+            control("Save", "Save queued message", () => action(row, "edit", editing.text), busy !== null || !editing.text.trim()),
+            control("Cancel", "Cancel editing", () => setEditing(null), busy !== null)
+          ) : mutable ? h(
+            React2.Fragment,
+            null,
+            control("Edit", "Edit queued message", () => setEditing({ id: row.id, text }), busy !== null || attachments > 0),
+            control("Steer", "Steer this queued message", () => action(row, "steer"), busy !== null || !running),
+            control("Send now", "Stop current step and send this queued message", () => action(row, "override"), busy !== null || !running),
+            control("\uFFFD", "Remove queued message", () => action(row, "remove"), busy !== null)
+          ) : null
+        );
+      }),
+      ...sending.map((row) => h("div", { key: row.requestId, className: "dsh-queued-row" }, h("span", { className: "dsh-queued-preview" }, row.text || "Attached message"), h("span", { style: { fontSize: 11, color: "var(--dsw-alias-label-secondary)" } }, "Sending\uFFFD"))),
+      notice ? h("div", { role: "status", "aria-live": "polite", style: { fontSize: 11, padding: "3px 4px", color: "var(--dsw-alias-label-secondary)" } }, notice) : null
+    );
+  }
+  slots.inject("conversation.input.dock", () => slots.register({
+    name: "conversation.input.dock",
+    id: "dsh-queued-message-actions",
+    order: 10,
+    label: "Interactive queued messages"
+  }, QueuedMessages));
   slots.inject("conversation.input.right", () => slots.register({
     name: "conversation.input.right",
     id: "dsh-busy-draft-actions",
