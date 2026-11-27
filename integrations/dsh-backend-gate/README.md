@@ -10,7 +10,7 @@ Provider routing is exact:
 | `hyperqwen-local`, `hyperqwen-local-compact` | Qwen | `http://127.0.0.1:18021` |
 | `hyperinkling-local`, `hyperinkling-local-compact` | HyperInkling | `http://127.0.0.1:18023` |
 
-On first use after DSH starts, the gate probes all three backends. It unloads every active non-target backend before starting or waking the selected one. A missing HyperInkling server is treated as idle while routing Maya/Qwen; selecting HyperInkling starts the WSL systemd unit on demand, waits for `/is_sleeping`, and wakes it if needed. Switching away uses vLLM level-1 sleep, which offloads weights and discards the KV cache. Status or unload errors fail the request; the gate does not assume that an unknown reachable service is idle. Maya unload uses its existing `POST /models/unload` endpoint and therefore requires Maya model management to be enabled. Qwen unload uses the added `POST /unload` router route. HyperInkling requires vLLM sleep mode enabled and the optional systemd unit installed as described below.
+On first use after DSH starts, the gate probes all three backends. It unloads every active non-target backend before starting or waking the selected one, so only one model occupies the 3090 at a time. A missing HyperInkling server is treated as idle while routing Maya/Qwen. Selecting HyperInkling starts the WSL systemd unit on demand and waits for it to become ready. If vLLM sleep mode is available, the gate uses level-1 sleep; otherwise it detects the live server through `/health` and stops its systemd unit when switching away. Status or unload errors fail the request; the gate does not assume that an unknown reachable service is idle. Maya unload uses its existing `POST /models/unload` endpoint and therefore requires Maya model management to be enabled. Qwen unload uses the added `POST /unload` router route.
 
 ## Install into a DSH profile
 
@@ -59,7 +59,7 @@ hyperinkling-local:
     - id: inkling-2-mini
       name: Abliterated Inkling 2 Mini (HyperInkling)
       input: [text, image]
-      contextWindow: 262144 # Set to the actual server max_model_len after its first boot.
+      contextWindow: 380416 # Match max_model_len from the live /v1/models response.
       maxTokens: 32768
 hyperinkling-local-compact:
   baseURL: http://127.0.0.1:18023/v1
@@ -68,13 +68,13 @@ hyperinkling-local-compact:
     - id: inkling-2-mini
       name: Abliterated Inkling 2 Mini (HyperInkling compact)
       input: [text]
-      contextWindow: 262144 # Must match the normal route's server context.
+      contextWindow: 380416 # Must match the normal route's server context.
       maxTokens: 4096
 ```
 
 ## On-demand HyperInkling service (Windows + WSL)
 
-Install `hyperinkling.service` into `/etc/systemd/system/` after editing its paths for the local clone. Create a private `.env` beside `start.sh` with the exact model path and serving settings. Keep `HOST=127.0.0.1`, `PORT=18023`, `DASHBOARD=0`, `MAX_LEN=auto`, `KEEP_FREE_GB=2`, and `EXTRA_ARGS=--enable-sleep-mode`. Set `IMAGES=999`, the upstream limit; the context window, rather than a small image-count cap, is the practical bound. Use `SPEC=dflash2` for best ordinary chat/code speed if its drafter is installed; use `SPEC=dspark` for long-document summarization. The unit is deliberately not enabled at boot: the DSH gate starts it when the HyperInkling route is selected. `Restart=on-failure` recovers a crashed server while preserving on-demand startup.
+Install `hyperinkling.service` into `/etc/systemd/system/` after editing its paths for the local clone. Create a private `.env` beside `start.sh` with the exact model path and serving settings. The current Windows/WSL setup uses `HOST=127.0.0.1`, `PORT=18023`, `DASHBOARD=0`, `MAX_LEN=auto`, `MAX_SEQS=1`, `GPU_UTIL=0.95`, `KEEP_FREE_GB=2`, `KV_DTYPE=fp8`, `KV_OFFLOAD_GB=0`, `SPEC=dflash2`, `IMAGES=999`, and an empty `EXTRA_ARGS`. Sleep mode and the CPU KV offload tier are disabled because they failed in this WSL/Python runtime; the DSH gate uses health checks and stops the service on switch-away. After the first boot, set DSH's `contextWindow` to the actual `max_model_len` returned by `/v1/models` (currently 380416). The unit is deliberately not enabled at boot: the DSH gate starts it when the HyperInkling route is selected. `Restart=on-failure` recovers a crashed server while preserving on-demand startup.
 
 The gate invokes `wsl.exe -d Ubuntu -u root -- systemctl start hyperinkling.service`. Change `distro` and `serviceUnit` in the gate configuration if the local unit uses different names. Do not configure both HyperInkling and another model to start automatically on boot.
 

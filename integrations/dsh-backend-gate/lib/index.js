@@ -68,22 +68,42 @@ async function startHyperInklingService({ distro, unit }) {
   })
 }
 
+async function stopHyperInklingService({ distro, unit }) {
+  if (process.platform !== 'win32') {
+    throw new Error('automatic HyperInkling shutdown is configured for Windows + WSL only')
+  }
+  await execFileAsync('wsl.exe', ['-d', distro, '-u', 'root', '--', 'systemctl', 'stop', unit], {
+    timeout: 120_000,
+    windowsHide: true,
+  })
+}
+
 export function createBackendClients({
   fetchImpl = globalThis.fetch,
   urls = BACKEND_URLS,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   startTimeoutMs = 900_000,
   startService = startHyperInklingService,
+  stopService = stopHyperInklingService,
   distro = 'Ubuntu',
   serviceUnit = 'hyperinkling.service',
   pollIntervalMs = 2_000,
 } = {}) {
-  async function hyperinklingSleeping() {
-    const status = await requestJson(fetchImpl, `${urls.hyperinkling}/is_sleeping`, {}, timeoutMs)
-    if (typeof status?.is_sleeping !== 'boolean') {
-      throw new Error('HyperInkling /is_sleeping returned no boolean is_sleeping field')
+  async function hyperinklingState() {
+    try {
+      const status = await requestJson(fetchImpl, `${urls.hyperinkling}/is_sleeping`, {}, timeoutMs)
+      if (typeof status?.is_sleeping !== 'boolean') {
+        throw new Error('HyperInkling /is_sleeping returned no boolean is_sleeping field')
+      }
+      return { sleeping: status.is_sleeping }
+    } catch (error) {
+      // The lean profile disables vLLM sleep mode because its cuMem allocator
+      // failed during WSL startup. A successful health probe is the loaded
+      // state; switching away stops the service to release the single GPU.
+      if (!/HTTP 404\b/.test(error.message)) throw error
+      await requestJson(fetchImpl, `${urls.hyperinkling}/health`, {}, timeoutMs)
+      return { sleeping: false }
     }
-    return status.is_sleeping
   }
 
   async function waitForHyperInkling() {
@@ -91,7 +111,7 @@ export function createBackendClients({
     let lastError
     while (Date.now() < deadline) {
       try {
-        return await hyperinklingSleeping()
+        return (await hyperinklingState()).sleeping
       } catch (error) {
         if (!isConnectionError(error) && !isTransientHttpError(error)) throw error
         lastError = error
@@ -103,7 +123,8 @@ export function createBackendClients({
 
   return {
     async status(backend) {
-      const path = backend === 'maya' ? '/api/ps' : backend === 'hyperinkling' ? '/is_sleeping' : '/status'
+      if (backend === 'hyperinkling') return hyperinklingState()
+      const path = backend === 'maya' ? '/api/ps' : '/status'
       return requestJson(fetchImpl, `${urls[backend]}${path}`, {}, timeoutMs)
     },
     async loaded(backend) {
@@ -117,14 +138,14 @@ export function createBackendClients({
         throw error
       }
       if (backend === 'maya') return isMayaLoaded(status)
-      if (backend === 'hyperinkling') return status.is_sleeping === false
+      if (backend === 'hyperinkling') return status.sleeping === false
       return isQwenLoaded(status)
     },
     async ensure(backend) {
       if (backend !== 'hyperinkling') return
       let sleeping
       try {
-        sleeping = await hyperinklingSleeping()
+        sleeping = (await hyperinklingState()).sleeping
       } catch (error) {
         if (isConnectionError(error)) {
           await startService({ distro, unit: serviceUnit })
@@ -135,13 +156,19 @@ export function createBackendClients({
       }
       if (sleeping) {
         await requestJson(fetchImpl, `${urls.hyperinkling}/wake_up`, { method: 'POST' }, timeoutMs)
-        if (await hyperinklingSleeping()) throw new Error('HyperInkling remained asleep after wake_up')
+        if ((await hyperinklingState()).sleeping) throw new Error('HyperInkling remained asleep after wake_up')
       }
     },
     async unload(backend) {
       if (backend === 'hyperinkling') {
-        await requestJson(fetchImpl, `${urls.hyperinkling}/sleep?level=1&mode=wait`, { method: 'POST' }, timeoutMs)
-        return { status: 'sleeping' }
+        try {
+          await requestJson(fetchImpl, `${urls.hyperinkling}/sleep?level=1&mode=wait`, { method: 'POST' }, timeoutMs)
+          return { status: 'sleeping' }
+        } catch (error) {
+          if (!/HTTP 404\b/.test(error.message)) throw error
+          await stopService({ distro, unit: serviceUnit })
+          return { status: 'stopped' }
+        }
       }
       const path = backend === 'maya' ? '/models/unload' : '/unload'
       const body = backend === 'maya' ? {} : undefined

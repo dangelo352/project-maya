@@ -204,3 +204,35 @@ test('HyperInkling level-1 sleep releases GPU weights and KV cache when switched
     ['http://127.0.0.1:18023/sleep?level=1&mode=wait', 'POST'],
   ])
 })
+
+test('HyperInkling without sleep mode uses health and stops its WSL service on switch-away', async () => {
+  const calls = []
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([url, init.method ?? 'GET'])
+    if (url.endsWith('/is_sleeping') || url.includes('/sleep?')) {
+      return { ok: false, status: 404, json: async () => ({}) }
+    }
+    if (url.endsWith('/health')) return { ok: true, json: async () => ({ status: 'ok' }) }
+    throw new Error(`unexpected URL ${url}`)
+  }
+  const stopped = []
+  const io = createBackendClients({
+    fetchImpl,
+    stopService: async options => stopped.push(options),
+  })
+
+  assert.deepEqual(await io.status('hyperinkling'), { sleeping: false })
+  assert.equal(await io.loaded('hyperinkling'), true)
+  await io.ensure('hyperinkling')
+  assert.deepEqual(await io.unload('hyperinkling'), { status: 'stopped' })
+  assert.deepEqual(stopped, [{ distro: 'Ubuntu', unit: 'hyperinkling.service' }])
+  assert.deepEqual(calls, [
+    ['http://127.0.0.1:18023/is_sleeping', 'GET'],
+    ['http://127.0.0.1:18023/health', 'GET'],
+    ['http://127.0.0.1:18023/is_sleeping', 'GET'],
+    ['http://127.0.0.1:18023/health', 'GET'],
+    ['http://127.0.0.1:18023/is_sleeping', 'GET'],
+    ['http://127.0.0.1:18023/health', 'GET'],
+    ['http://127.0.0.1:18023/sleep?level=1&mode=wait', 'POST'],
+  ])
+})
