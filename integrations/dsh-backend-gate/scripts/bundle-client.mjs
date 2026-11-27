@@ -44,7 +44,7 @@ face.apply({
     callback({
       slots: {
         inject(name, register) {
-          if (name !== 'conversation.composer.dock') throw new Error(`unexpected slot ${name}`)
+          if (name !== 'conversation.input.dock') throw new Error(`unexpected slot ${name}`)
           register()
         },
         register(options, component) {

@@ -10,6 +10,8 @@ const phaseLabels = {
   loading: 'Loading selected model',
   ready: 'Model is ready',
   error: 'Model switch failed',
+  serving: 'Model loaded - waiting for engine output',
+  'status-unavailable': 'Waiting for backend status - no engine reading available',
 }
 
 function elapsedLabel(ms) {
@@ -41,7 +43,9 @@ function backendDetail(snapshot) {
 export function mount(React, slots, remoteSession, fetchImpl = fetch) {
   const h = React.createElement
 
-  function SwitchCard({ sessionId }) {
+  function SwitchCard({ sessionId, useSession }) {
+    const running = useSession(value => value.running)
+    const [rate, setRate] = React.useState(null)
     const [snapshot, setSnapshot] = React.useState(null)
     const [elapsed, setElapsed] = React.useState(0)
     const [cancelState, setCancelState] = React.useState('idle')
@@ -61,8 +65,18 @@ export function mount(React, slots, remoteSession, fetchImpl = fetch) {
           })
           if (!response.ok) throw new Error(`status endpoint returned HTTP ${response.status}`)
           const data = await response.json()
+          let measured = null
+          try {
+            const r = await fetchImpl('/api/dsh-server-tps', { cache: 'no-store', signal: controller.signal })
+            if (r.ok) measured = await r.json()
+          } catch { /* Never substitute an estimated TPS for a missing engine sample. */ }
           if (active) {
-            setSnapshot(data?.sessionId === sessionId ? data : null)
+            setRate(measured)
+            setSnapshot(data?.sessionId === sessionId ? data : {
+              sessionId, backend: 'local', model: 'Local inference engine',
+              phase: measured && measured.state !== 'unavailable' ? 'serving' : 'status-unavailable',
+              observed: true, startedAt: Date.now(), updatedAt: Date.now(),
+            })
             if (!data || data.sessionId !== sessionId || ['ready', 'error'].includes(data.phase)) {
               setCancelState('idle')
             }
@@ -91,11 +105,12 @@ export function mount(React, slots, remoteSession, fetchImpl = fetch) {
 
     React.useEffect(() => { setCancelState('idle') }, [snapshot?.startedAt])
 
-    const visible = snapshot?.sessionId === sessionId
+    const visible = snapshot?.sessionId === sessionId && (!snapshot.observed || running || snapshot.phase === 'loading')
     if (!visible) return null
 
     const phase = snapshot.phase
-    const done = phase === 'ready'
+    const serving = phase === 'serving'
+    const done = phase === 'ready' || serving
     const failed = phase === 'error'
     const waiting = phase === 'waiting-for-active-request'
     const blockers = [...new Set(snapshot.blockingSessionIds || [])]
@@ -108,7 +123,7 @@ export function mount(React, slots, remoteSession, fetchImpl = fetch) {
     const fillStyle = {
       height: '100%', width: done ? '100%' : failed ? '100%' : '38%',
       borderRadius: 99,
-      background: failed ? 'var(--danger, #ef6262)' : 'var(--accent, #77aaff)',
+      background: failed ? 'var(--danger, #ef6262)' : 'var(--dsw-alias-state-business-primary)',
       transformOrigin: 'left center',
       animation: done || failed ? 'none' : 'maya-switch-travel 1.45s ease-in-out infinite',
       transition: 'width .28s ease',
@@ -126,73 +141,33 @@ export function mount(React, slots, remoteSession, fetchImpl = fetch) {
       }
     }
 
-    const textColor = failed ? 'var(--danger, #ef6262)' : 'var(--fg, #ededed)'
-    const phaseLabel = phaseLabels[phase] || 'Switching local model'
+    const textColor = failed ? 'var(--danger, #ef6262)' : 'var(--dsw-alias-label-primary)'
+    const phaseLabel = serving ? (rate?.state === 'live' ? `Engine generating · ${rate.tps.toFixed(1)} tokens/sec` : 'Model loaded · no new engine tokens measured') : (phaseLabels[phase] || 'Switching local model')
     const duration = done || failed ? Math.max(0, (snapshot.finishedAt || Date.now()) - snapshot.startedAt) : elapsed
 
-    return h('section', {
-      'data-maya-model-switch': phase,
-      role: 'status',
-      'aria-live': 'polite',
-      style: {
-        position: 'relative', display: 'block', overflow: 'hidden',
-        margin: '8px 0', padding: '13px 15px', borderRadius: 14,
-        border: '1px solid var(--border, rgba(150,160,180,.2))',
-        background: 'linear-gradient(115deg, var(--bg-soft, rgba(127,127,127,.08)), var(--bg, rgba(40,40,45,.96)))',
-        color: textColor, boxShadow: '0 8px 24px rgba(0,0,0,.12)',
+    return h('div', {
+      'data-maya-model-switch': phase, role: 'status', 'aria-live': 'polite',
+      title: snapshot.error || `${modelName}: ${phaseLabel}. Engine token readings are shared across sessions.`,
+      style: { display: 'flex', alignItems: 'center', gap: 8, minHeight: 22,
+        width: '100%', maxWidth: 'var(--dsh-composer-card-max-width)', boxSizing: 'border-box',
+        padding: '0 12px', margin: '0 auto 3px', fontFamily: 'var(--dsw-font-family)',
+        color: failed ? 'var(--dsw-alias-state-danger, #c33)' : 'var(--dsw-alias-label-secondary)',
+        fontSize: 12, lineHeight: '20px',
       },
     },
-    h('style', null, '@keyframes maya-switch-travel{0%{transform:translateX(-110%)}100%{transform:translateX(285%)}}@keyframes maya-switch-pulse{0%,100%{transform:scale(.9);filter:saturate(.8)}50%{transform:scale(1.06);filter:saturate(1.25)}}'),
-    h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
-      h('span', {
-        'aria-hidden': true,
-        style: {
-          width: 28, height: 28, flex: '0 0 28px', borderRadius: '50%',
-          display: 'grid', placeItems: 'center',
-          background: 'radial-gradient(circle at 35% 30%, #dbeafe, #6c9eff 48%, #3451a3)',
-          boxShadow: done ? '0 0 18px rgba(100,180,255,.55)' : '0 0 13px rgba(100,150,255,.32)',
-          animation: done || failed ? 'none' : 'maya-switch-pulse 1.8s ease-in-out infinite',
-        },
-      }, 'âœ¦'),
-      h('div', { style: { minWidth: 0, flex: 1 } },
-        h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'baseline' } },
-          h('strong', { style: { fontSize: 13, fontWeight: 650 } }, `${done ? 'Ready' : failed ? 'Switch issue' : 'Switching'} Â· ${modelName}`),
-          h('span', { style: { fontSize: 11, color: 'var(--fg-muted, #9ca3af)', whiteSpace: 'nowrap' } }, elapsedLabel(duration)),
-        ),
-        h('div', { style: { marginTop: 3, fontSize: 12, color: 'var(--fg-muted, #a4aab6)' } }, phaseLabel),
-      ),
-    ),
-    h('div', {
-      role: 'progressbar',
-      'aria-label': `Loading ${modelName}`,
-      'aria-valuemin': 0,
-      'aria-valuemax': 100,
-      ...(done ? { 'aria-valuenow': 100 } : {}),
-      'aria-valuetext': done ? 'Backend reports ready' : phaseLabel,
-      style: trackStyle,
-    }, h('div', { style: fillStyle })),
-    h('div', { style: { display: 'flex', gap: 10, alignItems: 'center', justifyContent: 'space-between', marginTop: 8 } },
-      h('span', { style: { fontSize: 11, lineHeight: 1.45, color: 'var(--fg-muted, #9ca3af)' } },
-        snapshot.error ? snapshot.error : snapshot.statusUnavailable ? 'Live status endpoint temporarily unavailable.' : backendDetail(snapshot)),
-        canStopForSwitch(snapshot, sessionId) && typeof remoteSession?.cancel === 'function'
-        ? h('button', {
-          type: 'button', onClick: stopAndSwitch, disabled: cancelState === 'stopping',
-          style: {
-            flex: '0 0 auto', border: '1px solid var(--border, rgba(150,160,180,.25))',
-            borderRadius: 9, padding: '7px 10px', color: 'var(--fg, #ededed)',
-            background: 'var(--bg-soft, rgba(127,127,127,.12))', cursor: 'pointer', fontSize: 11,
-          },
-        }, cancelState === 'stopping' ? 'Stoppingâ€¦' : `Stop ${blockers.length} active ${blockers.length === 1 ? 'turn' : 'turns'} & switch`)
-        : null,
-    ),
-    cancelState === 'sent' ? h('div', { style: { marginTop: 6, fontSize: 11, color: 'var(--fg-muted, #9ca3af)' } }, 'Stop sent to DSH. Queued inbox work remains in the session.') : null,
-    cancelState.startsWith('failed:') ? h('div', { role: 'alert', style: { marginTop: 6, fontSize: 11, color: 'var(--danger, #ef6262)' } }, cancelState.slice(7)) : null,
-    !done && !failed ? h('div', { style: { marginTop: 5, fontSize: 10, color: 'var(--fg-muted, #8f96a3)' } }, 'The backend exposes load phases, not a reliable percentage; the moving bar is indeterminate until it confirms ready.') : null,
+      h('style', null, '[data-chat-running]{display:none!important}@keyframes maya-switch-travel{0%{transform:translateX(-110%)}100%{transform:translateX(285%)}}@media(prefers-reduced-motion:reduce){[data-maya-model-switch] i{animation:none!important}}'),
+      !done && !failed ? h('span', {
+        role: 'progressbar', 'aria-label': phaseLabel,
+        style: { width: 42, height: 3, borderRadius: 4, overflow: 'hidden', flex: '0 0 auto', background: 'var(--dsw-alias-border-l2)' },
+      }, h('i', { style: { display: 'block', width: '38%', height: '100%', background: 'var(--dsw-alias-state-business-primary)', animation: 'maya-switch-travel 1.45s ease-in-out infinite' } })) : null,
+      h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+        snapshot.error ? `Load failed: ${snapshot.error}` : phaseLabel),
+      !snapshot.observed ? h('span', { style: { marginLeft: 'auto', flex: '0 0 auto', fontVariantNumeric: 'tabular-nums' } }, elapsedLabel(duration)) : null,
     )
   }
 
-  slots.inject('conversation.composer.dock', () => slots.register({
-    name: 'conversation.composer.dock', id: 'maya-model-switch-card', order: -20,
+  slots.inject('conversation.input.dock', () => slots.register({
+    name: 'conversation.input.dock', id: 'maya-model-switch-card', order: -20,
     label: 'Live local-model switch status',
   }, SwitchCard))
 }

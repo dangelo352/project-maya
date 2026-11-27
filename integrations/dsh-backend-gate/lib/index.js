@@ -418,9 +418,23 @@ export class BackendGate {
     }
   }
 
-  async statusSnapshot() {
+  async statusSnapshot(sessionId) {
     const current = this.switchStatus
-    if (!current) return null
+    if (current && sessionId && current.sessionId !== sessionId) return null
+    if (!current || (current.finishedAt && Date.now() - current.finishedAt > 12000)) {
+      for (const backend of Object.keys(BACKEND_URLS)) {
+        try {
+          const raw = await this.clients.status(backend, 900)
+          const status = summarizeBackendStatus(backend, raw)
+          if (['ready', 'loading'].includes(status.state)) return {
+            sessionId: String(sessionId ?? ''), backend,
+            model: status.model || backend, phase: status.state === 'loading' ? 'loading' : 'serving',
+            startedAt: Date.now(), updatedAt: Date.now(), backendStatus: status, observed: true,
+          }
+        } catch { /* An unavailable backend cannot report a lifecycle state. */ }
+      }
+      return null
+    }
     const completedAt = current.finishedAt ?? current.updatedAt
     const active = !['ready', 'error'].includes(current.phase)
     const retentionMs = current.phase === 'error' ? 30_000 : 12_000
@@ -454,7 +468,7 @@ export class BackendGate {
       this.transitioning = true
       let showRequestLoad = false
       try {
-      showRequestLoad = this.currentBackend !== target || !(await this.clients.loaded(target))
+      showRequestLoad = this.currentBackend !== target
       if (showRequestLoad) {
         this.switchStatus = {
           sessionId: String(sessionId ?? ''), provider, model, backend: target,
@@ -542,7 +556,7 @@ export function createSwitchStatusHandler(gate) {
         status: 400, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
     }
-    const snapshot = await gate.statusSnapshot()
+    const snapshot = await gate.statusSnapshot(url.searchParams.get('sessionId'))
     if (url.searchParams.has('sessionId') && snapshot?.sessionId !== url.searchParams.get('sessionId')) {
       return new Response('null', {
         status: 200, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
