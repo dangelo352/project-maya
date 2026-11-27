@@ -182,7 +182,9 @@ export function createBackendClients({
           await new Promise(resolve => setTimeout(resolve, pollIntervalMs))
           continue
         }
-        if (status?.last_error) throw new Error(`Qwen model load failed: ${status.last_error}`)
+        // last_error may describe a failed switch followed by successful rollback.
+        // The requested /load operation reports current failures; do not let a
+        // historical error block a healthy active model or prevent a retry.
         return status
       } catch (error) {
         if (isConnectionError(error) && !sawLoading) throw new Error(`Qwen router is offline: ${error.message}`)

@@ -380,3 +380,13 @@ test('HyperInkling without sleep mode uses health and stops its WSL service on s
     ['http://127.0.0.1:18023/sleep?level=1&mode=wait', 'POST'],
   ])
 })
+
+test('Qwen rollback stale error does not block a healthy active checkpoint', async () => {
+  const io = createBackendClients({
+    fetchImpl: async url => {
+      assert.ok(url.endsWith('/status'), 'healthy rollback must not reload the model')
+      return { ok: true, json: async () => ({ active_model: 'qwen3.8-27b', engine_pid: 42, loading_model: null, last_error: 'older OrcaRouter load failed' }) }
+    },
+  })
+  await io.ensure('qwen', 'qwen3.8-27b')
+})

@@ -7,7 +7,8 @@
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./recovery": "./lib/recovery.js"
   },
   "scripts": {
     "bundle:client": "node ./scripts/bundle-client.mjs",
