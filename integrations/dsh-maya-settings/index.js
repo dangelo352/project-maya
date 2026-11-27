@@ -25,14 +25,32 @@ export function createContextHandler(fetchImpl = fetch) {
     const url = new URL(request.url)
     if (url.search || url.searchParams.size) return json({ error: 'query_not_supported' }, 400)
     if (request.method === 'GET') {
-      try {
-        const response = await fetchImpl(MAYA_CONTEXT_URL, { signal: AbortSignal.timeout(5000) })
-        const data = await response.json()
-        if (!response.ok) return json({ error: 'maya_context_unavailable', status: response.status }, 502)
-        return json(data)
-      } catch {
-        return json({ error: 'maya_context_unavailable' }, 502)
+      const [contextResult, healthResult] = await Promise.allSettled([
+        fetchImpl(MAYA_CONTEXT_URL, { signal: AbortSignal.timeout(5000) }),
+        fetchImpl('http://127.0.0.1:18022/health', { signal: AbortSignal.timeout(5000) }),
+      ])
+      let context = null
+      let contextBounds = { min: 4096, max: 262144 }
+      if (contextResult.status === 'fulfilled' && contextResult.value.ok) {
+        const data = await contextResult.value.json()
+        context = data.context ?? null
+        contextBounds = { min: data.min ?? contextBounds.min, max: data.max ?? contextBounds.max }
       }
+      let server = { status: 'offline' }
+      if (healthResult.status === 'fulfilled' && healthResult.value.ok) {
+        const health = await healthResult.value.json()
+        server = {
+          status: health.status ?? 'unknown',
+          model: health.model ?? null,
+          version: health.version ?? null,
+          maxContext: health.max_context ?? null,
+          images: health.images === true,
+          videos: health.videos === true,
+          unloaded: health.unloaded === true,
+        }
+        if (context === null) context = health.max_context ?? null
+      }
+      return json({ context, ...contextBounds, server })
     }
     if (request.method !== 'POST') return new Response(null, { status: 405, headers: { allow: 'GET, POST' } })
     if (!sameHostOrigin(request)) return json({ error: 'same_origin_required' }, 403)

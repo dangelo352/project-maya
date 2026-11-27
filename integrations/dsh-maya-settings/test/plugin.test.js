@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createContextHandler } from '../index.js'
-import { apply as applyClient, findNamespace, readMayaValues, updateCompactionPatch, updateProviderPatch } from '../client-src.js'
+import { apply as applyClient, findNamespace, readMayaValues, readPresetCompactionValues, updateCompactionPatch, updatePresetCompactionPatch, updateProviderPatch } from '../client-src.js'
 
 const request = (method, body, headers = {}) => new Request('http://dsh.local/api/maya-live-settings', {
   method,
@@ -10,10 +10,15 @@ const request = (method, body, headers = {}) => new Request('http://dsh.local/ap
 })
 
 test('context bridge reads the bounded context status from Maya', async () => {
-  const handle = createContextHandler(async () => Response.json({ context: 200704, min: 4096, max: 262144 }))
+  const handle = createContextHandler(async (url) => String(url).endsWith('/health')
+    ? Response.json({ status: 'ok', model: 'inkling-2-mini', version: 'test', max_context: 200704, images: true })
+    : Response.json({ context: 200704, min: 4096, max: 262144 }))
   const response = await handle(request('GET'))
   assert.equal(response.status, 200)
-  assert.equal((await response.json()).context, 200704)
+  const data = await response.json()
+  assert.equal(data.context, 200704)
+  assert.equal(data.server.model, 'inkling-2-mini')
+  assert.equal(data.server.images, true)
 })
 
 test('context update validates bounds and sends only max_context to Maya', async () => {
@@ -40,13 +45,31 @@ test('context bridge rejects cross-origin writes and invalid sizes', async () =>
 })
 
 test('Maya settings helpers preserve unrelated provider and compaction rows', () => {
-  const llm = { revision: 1, value: { providers: { 'maya-local': { models: [{ id: 'inkling-2-mini', contextWindow: 200704, maxTokens: 32768 }, { id: 'other', maxTokens: 10 }] }, other: { keep: true } } } }
+  const llm = { revision: 1, value: { providers: { 'maya-local': { reasoning: 'high', models: [{ id: 'inkling-2-mini', contextWindow: 200704, maxTokens: 32768, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high' } }, { id: 'other', maxTokens: 10 }] }, other: { keep: true } } } }
   const compaction = { revision: 2, value: { modelPolicies: [{ provider: 'maya-local', model: 'inkling-2-mini', thresholdRatio: 0.65, maxTokens: 4096 }, { provider: 'other', model: 'other', thresholdRatio: 0.7 }] } }
-  assert.deepEqual(readMayaValues(llm, compaction), { context: 200704, maxTokens: 32768, compactPct: 65 })
-  assert.deepEqual(readMayaValues(llm, null), { context: 200704, maxTokens: 32768, compactPct: null })
-  assert.equal(updateProviderPatch(llm, { maxTokens: 20000 }).providers.other.keep, true)
+  const values = readMayaValues(llm, compaction)
+  assert.equal(values.context, 200704)
+  assert.equal(values.maxTokens, 32768)
+  assert.equal(values.reasoning, 'high')
+  assert.deepEqual(values.reasoningEfforts, { low: 'low', medium: 'medium', high: 'high' })
+  assert.equal(values.compactPct, 65)
+  assert.equal(readMayaValues(llm, null).compactPct, null)
+  const changed = updateProviderPatch(llm, { maxTokens: 20000, reasoning: 'low', maxRequestImages: 1000000 })
+  assert.equal(changed.providers['maya-local'].models[0].maxTokens, 20000)
+  assert.equal(changed.providers['maya-local'].reasoning, 'low')
+  assert.equal(changed.providers['maya-local'].maxRequestImages, 1000000)
+  assert.equal(changed.providers.other.keep, true)
   assert.equal(updateCompactionPatch(compaction, 75).modelPolicies[1].thresholdRatio, 0.7)
   assert.throws(() => findNamespace({ ok: true, value: { namespaces: [] } }, 'missing'))
+})
+
+test('shared preset compaction helpers preserve unrelated summary settings', () => {
+  const view = { value: { compactThresholdPct: 65, summarize: { images: 'strip', keepTurns: 5, toolChars: 2000, capRatio: 0.75, extra: true } } }
+  assert.deepEqual(readPresetCompactionValues(view), { compactPct: 65, images: 'strip', keepTurns: 5, toolChars: 2000, capRatio: 0.75 })
+  const changed = updatePresetCompactionPatch(view, { compactPct: 72, images: 'keep', keepTurns: 8, toolChars: 3000, capRatio: 0.9 })
+  assert.equal(changed.compactThresholdPct, 72)
+  assert.equal(changed.summarize.images, 'keep')
+  assert.equal(changed.summarize.extra, true)
 })
 
 test('client settings page obtains slots and remote settings through injection', () => {
