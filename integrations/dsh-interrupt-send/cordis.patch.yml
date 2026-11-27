@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-interrupt-send
+      name: '@maya/dsh-interrupt-send'

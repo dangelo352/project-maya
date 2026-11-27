@@ -1,0 +1,29 @@
+{
+  "name": "@maya/dsh-interrupt-send",
+  "version": "0.1.0",
+  "private": true,
+  "description": "One-click cancel-and-send action for active DeepSeek Harness sessions",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "bundle:client": "node ./scripts/bundle-client.mjs"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-api-session-controller"
+      ],
+      "platform": "web"
+    }
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}
