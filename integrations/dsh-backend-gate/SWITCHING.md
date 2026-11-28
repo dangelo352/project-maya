@@ -10,7 +10,9 @@ When a switch is waiting on active local-model work, the card offers an explicit
 
 Model selection starts the handoff immediately. The gate waits for active streams, unloads the old GPU model, and loads the selected model. It keeps at most one model resident in GPU memory. A cold switch cannot be instantaneous without keeping the next model resident somewhere. Both servers stay available, and the operating system may retain recently read checkpoint pages in its filesystem cache. That cache uses system RAM, is opportunistic, and can be evicted under memory pressure.
 
-The current Qwen router stops the vLLM engine when unloading. It does not implement vLLM sleep/wake. Enabling level-1 sleep is a separate experiment and needs a real switch test with the installed AutoRound model and custom kernels before replacing the current unload/reload path. It may keep weights in CPU RAM while freeing GPU memory, but it must be measured on this build before calling it faster or reliable.
+Normal Qwen unload parks the initialized vLLM engine and weights in system RAM. Full unload stops the engine. Maya currently exits its inference engine on unload and starts it again when selected. See [Warm unload](WARM-UNLOAD.md) for measurements and prompt cache behavior.
+
+The current gate checks backend activity before unloading, including requests made directly to a model server. It verifies release before starting the selected model. If verification fails, DSH reports the error and releases the switch lock so a later request can retry.
 
 ## Explicit Qwen loading
 

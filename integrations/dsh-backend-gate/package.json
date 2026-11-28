@@ -12,7 +12,8 @@
     "./memory-controls": "./lib/memory-controls.js",
     "./memory-controls-v2": "./lib/memory-controls-v2.js",
     "./memory-controls-v3": "./lib/memory-controls-v3.js",
-    "./memory-controls-v4": "./lib/memory-controls-v4.js"
+    "./memory-controls-v4": "./lib/memory-controls-v4.js",
+    "./memory-controls-v5": "./lib/memory-controls-v5.js"
   },
   "scripts": {
     "bundle:client": "node ./scripts/bundle-client.mjs",

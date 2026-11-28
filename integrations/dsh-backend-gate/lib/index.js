@@ -247,6 +247,20 @@ export function createBackendClients({
       if (backend === 'hyperinkling') return status.sleeping === false
       return isQwenLoaded(status)
     },
+    async released(backend) {
+      if (backend !== 'maya') return !await this.loaded(backend, 5000)
+      // Maya's health flag can stay "loaded" after an engine crash. Check the
+      // native process gauge after the unload endpoint completes its GPU wait.
+      let response
+      try {
+        response = await fetchImpl(`${urls.maya}/metrics/prometheus`, { signal: AbortSignal.timeout(5000) })
+      } catch (error) {
+        if (isConnectionError(error)) return false
+        throw error
+      }
+      if (!response.ok) return false
+      return /^maya:engine_alive\s+0(?:\.0+)?[ \t]*\r?$/m.test(await response.text())
+    },
     async ensure(backend, model) {
       if (backend === 'maya') {
         try {
@@ -374,6 +388,29 @@ export class BackendGate {
     return revision !== undefined && revision !== this.selectionRevision
   }
 
+  async releaseForSwitch(backend, revision, knownLoaded = false) {
+    if (this.clients.activity) {
+      if (!knownLoaded && !await this.clients.loaded(backend, 5000)) return true
+      const deadline = Date.now() + this.timeoutMs
+      for (;;) {
+        if (this.isStale(revision)) return false
+        const { busy } = await this.clients.activity(backend, 2000)
+        if (!busy) break
+        this.updateSwitch('waiting-for-active-request', { from: backend })
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) throw new Error(`${backend} is still processing work. Try switching again after it finishes.`)
+        await new Promise(resolve => setTimeout(resolve, Math.min(500, remaining)))
+      }
+    }
+    if (this.isStale(revision)) return false
+    this.updateSwitch('unloading', { from: backend })
+    await this.clients.unload(backend)
+    if (this.clients.released && !await this.clients.released(backend)) {
+      throw new Error(`Could not verify that ${backend} released its model. The next model was not started.`)
+    }
+    return true
+  }
+
   async reconcile(target, revision, model) {
     this.updateSwitch('checking-existing-models')
     const backends = Object.keys(BACKEND_URLS)
@@ -381,8 +418,7 @@ export class BackendGate {
     for (const [backend, loaded] of states) {
       if (this.isStale(revision)) return false
       if (backend !== target && loaded) {
-        this.updateSwitch('unloading', { from: backend })
-        await this.clients.unload(backend)
+        if (!await this.releaseForSwitch(backend, revision, true)) return false
       }
     }
     if (this.isStale(revision)) return false
@@ -397,8 +433,7 @@ export class BackendGate {
       return this.reconcile(target, revision, model)
     } else {
       const previous = this.currentBackend
-      this.updateSwitch('unloading', { from: previous })
-      await this.clients.unload(previous)
+      if (!await this.releaseForSwitch(previous, revision)) return false
       this.currentBackend = null
       if (this.isStale(revision)) return false
       this.updateSwitch('loading')

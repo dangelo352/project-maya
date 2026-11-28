@@ -148,6 +148,44 @@ test('unload failure rejects the switch and preserves prior backend', async () =
   assert.equal(gate.activeRequests, 0)
 })
 
+test('switch waits for backend work outside DSH, then fails safely if release cannot be verified', async () => {
+  const steps = []
+  let probes = 0
+  let released = false
+  const gate = new BackendGate({ clients: clients({
+    loaded: async () => true,
+    activity: async () => { steps.push('activity'); return { busy: probes++ === 0 } },
+    unload: async () => { steps.push('unload') },
+    released: async () => { steps.push('verify'); return released },
+    ensure: async () => { steps.push('load') },
+  }) })
+  gate.currentBackend = 'maya'
+  const handoff = gate.acquire('hyperqwen-local')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(steps, ['activity'])
+  await assert.rejects(handoff, /Could not verify/)
+  assert.deepEqual(steps, ['activity', 'activity', 'unload', 'verify'])
+  assert.equal(gate.currentBackend, 'maya')
+  assert.equal(gate.transitioning, false)
+  released = true
+  const done = await gate.acquire('hyperqwen-local')
+  assert.deepEqual(steps.slice(-4), ['activity', 'unload', 'verify', 'load'])
+  done()
+})
+
+test('Maya release confirmation requires the native engine process gauge', async () => {
+  let data = 'maya:engine_alive 1\n'
+  const io = createBackendClients({ fetchImpl: async url => {
+    assert.match(url, /\/metrics\/prometheus$/)
+    return new Response(data)
+  } })
+  assert.equal(await io.released('maya'), false)
+  data = '# TYPE maya:engine_alive gauge\r\nmaya:engine_alive 0\r\n'
+  assert.equal(await io.released('maya'), true)
+  data = '# gauge missing\n'
+  assert.equal(await io.released('maya'), false)
+})
+
 test('unknown bootstrap probes both endpoints and unloads loaded non-target', async () => {
   const io = clients({
     loaded: async backend => { io.calls.push(['status', backend]); return backend === 'maya' },
