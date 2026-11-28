@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createLocalModelHandler, LOCAL_MODEL_ROUTE } from './local-model-control.js?warm-resume=20261127'
+import { createMayaPrefetch } from './maya-prefetch.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -121,10 +122,12 @@ export function createBackendClients({
   mayaConfig = 'build/maya-dsh-200k.json',
   mayaHost = '127.0.0.1',
   mayaPort = 18022,
+  mayaPrefetch = true,
   pollIntervalMs = 2_000,
   qwenMetricsUrl = 'http://127.0.0.1:18020/metrics',
   qwenQueueUrl = 'http://127.0.0.1:18026/priority/queue',
 } = {}) {
+  const prefetch = createMayaPrefetch({ python: mayaPython, cwd: mayaCwd, config: mayaConfig, enabled: mayaPrefetch })
   async function hyperinklingState(requestTimeoutMs = timeoutMs) {
     try {
       const status = await requestJson(fetchImpl, `${urls.hyperinkling}/is_sleeping`, {}, requestTimeoutMs)
@@ -200,6 +203,7 @@ export function createBackendClients({
   }
 
   return {
+    stopMayaPrefetch: prefetch.stop,
     async activity(backend, requestTimeoutMs = 1500) {
       if (backend === 'maya') {
         const value = await requestJson(fetchImpl, `${urls.maya}/status`, {}, requestTimeoutMs)
@@ -229,7 +233,8 @@ export function createBackendClients({
         ])
         // Only live activity leaves this boundary; metrics history and log tails stay private.
         const { activity } = summarizeBackendStatus('maya', { ...health, live: metrics?.live })
-        return { ...health, ...(activity ? { activity } : {}) }
+        return { ...health, ...(activity ? { activity } : {}),
+          ...(health.unloaded === true && prefetch.state ? { checkpointCache: prefetch.state } : {}) }
       }
       return requestJson(fetchImpl, `${urls[backend]}/status`, {}, requestTimeoutMs)
     },
@@ -263,6 +268,7 @@ export function createBackendClients({
     },
     async ensure(backend, model) {
       if (backend === 'maya') {
+        prefetch.stop()
         try {
           const health = await requestJson(fetchImpl, `${urls.maya}/health`, {}, timeoutMs)
           if (health?.status === 'ok' && health?.unloaded !== true) return
@@ -340,6 +346,10 @@ export function createBackendClients({
       const state = result?.status?.value ?? result?.status
       if (result?.ok === false || result?.busy === true || state === 'busy' || state === 'error') {
         throw new Error(`${backend} unload failed: ${result.message ?? state ?? 'backend reported failure'}`)
+      }
+      if (backend === 'maya' && state === 'unloaded') {
+        if (mode === 'normal') prefetch.start()
+        else prefetch.stop()
       }
       return result
     },
@@ -609,6 +619,7 @@ export class BackendGate {
     // Acquire synchronously before any backend probe; new requests must wait for this handoff.
     this.transitioning = true
     ++this.selectionRevision
+    if (mode === 'full' && (backend === 'all' || backend === 'maya')) this.clients.stopMayaPrefetch?.()
     this.manualUnload = { phase: 'unloading', startedAt: Date.now(), backend, sessionId, mode }
     const unloaded = []
     try {
@@ -688,6 +699,7 @@ export function summarizeBackendStatus(name, status) {
       model: status.model ?? null,
       version: status.version ?? null,
       unloaded: status.unloaded === true,
+      ...(['warming', 'prefetched'].includes(status.checkpointCache) ? { checkpointCache: status.checkpointCache } : {}),
     }
   }
   if (name === 'qwen') {
@@ -752,6 +764,7 @@ function guardedStream(gate, options, next) {
 
 export function apply(ctx, config = {}) {
   const clients = createBackendClients(config)
+  ctx.effect(() => clients.stopMayaPrefetch, 'Maya checkpoint cache warmer')
   const gate = new BackendGate({ clients, aliases: config.aliases ?? BACKENDS, timeoutMs: config.timeoutMs })
   ctx.on('llm/stream', (options, next) => guardedStream(gate, options, next))
   ctx.on('session/event', (session, event) => {

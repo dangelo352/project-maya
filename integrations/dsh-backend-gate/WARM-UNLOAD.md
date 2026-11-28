@@ -4,7 +4,8 @@ The model-selector menu contains two existing-style actions; no composer row was
 
 - **Unload model** requests `mode: normal`. Qwen uses the router's verified RAM-ready sleep path when enabled: its initialized engine survives, model weights move to system RAM, and GPU KV state is discarded. It may retain a CUDA context/graph overhead in VRAM. The next load/request wakes that same engine.
 - **Fully unload · release RAM** requests `mode: full`. Qwen terminates its engine, including a parked engine; the next request cold-starts. Process-owned model RAM is released, while ordinary OS file cache remains reclaimable.
-- Maya currently uses its existing engine unload/restart in either mode. Hyperinkling's normal path retains its existing sleep-or-service-stop fallback; full mode stops the service. Do not advertise Qwen's warm-resume timing for other backends.
+- On Windows, Maya normal unload stops the engine and starts a background prefetch for the model and drafter GGUF files from its configured launch arguments. Windows can reclaim those file-backed pages. Maya reads the original files on the next load and still initializes its engine. The prefetch requires enough available RAM for the file sizes plus an 8 GiB reserve, rechecks the reserve while proceeding, and stops if Maya is selected, fully unloaded, or the DSH plugin is disposed. The full action stops prefetch; ordinary OS cache remains reclaimable. Disable this with `mayaPrefetch: false` in the gate configuration.
+- Hyperinkling's normal path retains its existing sleep-or-service-stop fallback; full mode stops the service.
 
 The API accepts `normal|full`, defaults to normal, and preserves its authenticated GET/non-persistent CSRF token and the one-time pre-dispatch token refresh. Work leases, backend activity, selection changes and inference share the existing handoff guard. Full unload includes already-parked Qwen state; it cannot skip RAM residency merely because GPU loaded=false.
 

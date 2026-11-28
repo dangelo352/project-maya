@@ -4,7 +4,7 @@ export const noticeDurationMs = 15000
 // Declared by dsh-client-ui-model-selection/src/client/slots.ts and rendered in ModelSelect's root menu.
 export const unloadSlot = 'conversation.input.model.options'
 const localBackends = new Set(['qwen', 'maya', 'hyperinkling'])
-const warning = 'Unload all local GPU models. Normal unload keeps Qwen weights in RAM for fast resume; Maya and Hyperinkling fall back to cold unload. Fully unload stops the engine and releases model RAM. Normal requests and goals may reload them.'
+const warning = 'Unload all local GPU models. Normal unload parks Qwen in RAM and prefetches Maya’s weights into the Windows file cache when memory permits. Fully unload stops engines and background prefetch. Windows reclaims file cache as needed.'
 
 export async function requestLocalModels(fetchImpl, { sessionId, signal, unload = false, mode = 'normal', csrfToken } = {}) {
   const freshToken = async () => {
@@ -42,7 +42,7 @@ export async function requestLocalModels(fetchImpl, { sessionId, signal, unload 
 
 export function unloadView(snapshot, { inFlight = false, locked = false, notice = null, statusError = null, now = Date.now() } = {}) {
   const backends = (snapshot?.backends || []).filter(item => localBackends.has(item.backend))
-  const hidden = backends.length === 0 || backends.every(item => ['offline', 'unloaded'].includes(item.state))
+  const hidden = backends.length === 0 || backends.every(item => ['offline', 'unloaded'].includes(item.state) && !item.checkpointCache)
   const busy = locked || inFlight || !!snapshot?.backendBusy || !!snapshot?.transitioning || snapshot?.unload?.phase === 'unloading'
     || snapshot?.activeRequests > 0 || snapshot?.pendingRequests > 0
   const recent = notice && now - notice.at < noticeDurationMs ? notice : null
@@ -50,13 +50,18 @@ export function unloadView(snapshot, { inFlight = false, locked = false, notice 
   const success = recent?.kind === 'success' && backends.every(item => (recent.mode === 'full' ? ['offline', 'unloaded', 'sleeping'] : ['offline', 'unloaded', 'sleeping', 'parked']).includes(item.state))
   const error = recent?.kind === 'error' ? recent.message : statusError ||
     (snapshot?.unload?.phase === 'error' ? snapshot.unload.error || 'Unload failed. Retry when idle.' : null)
-  const states = backends.map(item => `${{ qwen: 'Qwen', maya: 'Maya', hyperinkling: 'Hyperinkling' }[item.backend]}: ${item.backend === 'qwen' && item.state === 'parked' ? 'ready in RAM' : item.state || 'unknown'}`).join(' · ')
+  const states = backends.map(item => {
+    const name = { qwen: 'Qwen', maya: 'Maya', hyperinkling: 'Hyperinkling' }[item.backend]
+    const cache = { warming: 'warming weight cache', prefetched: 'weights prefetched' }[item.checkpointCache]
+    const state = item.backend === 'qwen' && item.state === 'parked' ? 'ready in RAM' : cache || item.state || 'unknown'
+    return `${name}: ${state}`
+  }).join(' · ')
   return {
     visible: inFlight || !hidden || !!recent,
     disabled: busy || !!statusError || !snapshot || hidden,
     busy,
     label: error ? `Unload unavailable: ${error}` : inFlight || snapshot?.unload?.phase === 'unloading'
-      ? 'Unloading local models…' : success && !backends.some(item => item.state === 'parked')
+      ? 'Unloading local models…' : success && !backends.some(item => item.state === 'parked' || item.checkpointCache)
         ? recent.mode === 'full' ? 'Fully unloaded · model RAM released' : 'Model unloaded · next request resumes or reloads' : states || 'Local models unavailable',
     error: !!error,
     title: `${error ? `${error} ` : ''}${warning}${busy ? ' Waiting for local backend work to finish.' : ''}`,
@@ -151,7 +156,7 @@ export function mountUnload(React, slots, fetchImpl = fetch) {
     },
     ...['normal', 'full'].map(mode => h('button', { key: mode, type: 'button', role: 'menuitem', disabled: view.disabled,
       onClick: () => unload(mode),
-      'aria-label': mode === 'full' ? 'Fully unload — all local GPU backends; release model RAM' : 'Unload model — all local GPU backends; Qwen fast resume',
+      'aria-label': mode === 'full' ? 'Fully unload — all local GPU backends; release model RAM' : 'Unload model — all local GPU backends; prepare for reload',
       'aria-busy': inFlight === mode,
       title: mode === 'full' ? 'Stop local engines and release model RAM. Next request cold loads the model.' : view.title,
       style: { font: 'inherit', fontSize: 13, lineHeight: '20px', textAlign: 'left',
