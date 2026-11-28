@@ -3,7 +3,7 @@
 import { spawn } from 'node:child_process'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { createLocalModelHandler, LOCAL_MODEL_ROUTE } from './local-model-control.js'
+import { createLocalModelHandler, LOCAL_MODEL_ROUTE } from './local-model-control.js?csrf=20261127'
 
 const execFileAsync = promisify(execFile)
 

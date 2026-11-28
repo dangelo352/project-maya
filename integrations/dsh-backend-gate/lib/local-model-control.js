@@ -6,19 +6,30 @@ const json = (body, status = 200) => new Response(JSON.stringify(body), {
 
 function sameOrigin(request) {
   const origin = request.headers.get('origin')
+  if (request.headers.get('sec-fetch-site') === 'cross-site') return false
+  // Electron verifies the renderer, then deliberately removes Origin when it
+  // forwards dsh-app://app requests with its private Host cookie. The separate
+  // synchronizer token below authenticates the action in this missing-header case.
+  if (!origin) return true
   const host = request.headers.get('x-forwarded-host')?.split(',')[0].trim() || request.headers.get('host') || new URL(request.url).host
   try {
-    return Boolean(origin) && new URL(origin).host.toLowerCase() === host.toLowerCase()
-      && request.headers.get('sec-fetch-site') !== 'cross-site'
+    const parsed = new URL(origin)
+    return ['http:', 'https:'].includes(parsed.protocol) && parsed.host.toLowerCase() === host.toLowerCase()
   } catch { return false }
 }
 
-export function createLocalModelHandler(gate) {
+export function createLocalModelHandler(gate, { csrfToken = randomBytes(32).toString('base64url') } = {}) {
+  const expected = Buffer.from(csrfToken)
+  const validToken = request => {
+    const supplied = Buffer.from(request.headers.get('x-dsh-csrf-token') ?? '')
+    return supplied.length === expected.length && timingSafeEqual(supplied, expected)
+  }
   return async request => {
     if (new URL(request.url).search) return json({ ok: false, error: 'invalid_query' }, 400)
-    if (request.method === 'GET') return json(await gate.localStatusSnapshot())
+    if (request.method === 'GET') return json({ ...await gate.localStatusSnapshot(), csrfToken })
     if (request.method !== 'POST') return new Response(null, { status: 405, headers: { allow: 'GET, POST' } })
     if (!sameOrigin(request)) return json({ ok: false, error: 'same_origin_required' }, 403)
+    if (!validToken(request)) return json({ ok: false, error: 'csrf_token_required', message: 'Refresh model status before unloading.' }, 403)
     if (!request.headers.get('content-type')?.toLowerCase().startsWith('application/json')) return json({ ok: false, error: 'json_required' }, 415)
     let body
     try {
@@ -41,3 +52,5 @@ export function createLocalModelHandler(gate) {
     }
   }
 }
+import { randomBytes, timingSafeEqual } from 'node:crypto'
+

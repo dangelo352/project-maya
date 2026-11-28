@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { BackendGate, parseEngineActivity } from '../lib/index.js'
 import { createLocalModelHandler } from '../lib/local-model-control.js'
+const TEST_TOKEN = 'T'.repeat(43)
 
 function fixture() {
   const resident = new Set(['qwen'])
@@ -16,10 +17,10 @@ function fixture() {
   }
   const gate = new BackendGate({ clients })
   gate.currentBackend = 'qwen'
-  return { gate, clients, resident, calls, handle: createLocalModelHandler(gate) }
+  return { gate, clients, resident, calls, handle: createLocalModelHandler(gate, { csrfToken: TEST_TOKEN }) }
 }
 const request = (body = { backend: 'all' }, extra = {}) => new Request('http://localhost/api/dsh-local-model', {
-  method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', ...extra.headers },
+  method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-dsh-csrf-token': TEST_TOKEN, ...extra.headers },
   body: typeof body === 'string' ? body : JSON.stringify(body),
 })
 
@@ -28,6 +29,7 @@ test('status is read-only and reports actual unloaded and sleeping backends', as
   const response = await f.handle(new Request('http://localhost/api/dsh-local-model'))
   assert.equal(response.headers.get('cache-control'), 'no-store')
   const data = await response.json()
+  assert.equal(data.csrfToken, TEST_TOKEN)
   assert.deepEqual(Object.fromEntries(data.backends.map(item => [item.backend, item.state])), { qwen: 'ready', maya: 'unloaded', hyperinkling: 'sleeping' })
   assert.deepEqual(f.calls, [])
 })
@@ -121,9 +123,9 @@ test('activity metrics include running and queued requests without double-counti
   assert.equal(parseEngineActivity('vllm:num_requests_running 0\nvllm:num_requests_waiting 0').busy, false)
   assert.throws(() => parseEngineActivity('vllm:num_requests_running 0'), /incomplete/)
 })
-test('unload is protected from cross-origin and missing-origin requests', async () => {
+test('unload is protected from explicit cross-origin and cross-site requests even with a valid token', async () => {
   const f = fixture()
-  for (const origin of ['', 'https://attacker.invalid'])
+  for (const origin of ['null', 'https://attacker.invalid'])
     assert.equal((await f.handle(request({}, { headers: { origin } }))).status, 403)
   assert.equal((await f.handle(request({}, { headers: { 'sec-fetch-site': 'cross-site' } }))).status, 403)
   assert.deepEqual(f.calls, [])
@@ -132,6 +134,33 @@ test('forwarded Tailscale origin is accepted without hardcoded desktop hostname'
   const f = fixture()
   const result = await f.handle(request({}, { headers: { origin: 'https://desktop.example.ts.net', 'x-forwarded-host': 'desktop.example.ts.net' } }))
   assert.equal(result.status, 200)
+})
+test('real Electron bridge shape succeeds without Origin or Fetch Metadata when the synchronizer token is valid', async () => {
+  const f = fixture()
+  const forwarded = request()
+  forwarded.headers.delete('origin')
+  forwarded.headers.delete('sec-fetch-site')
+  forwarded.headers.set('host', '127.0.0.1:63676')
+  assert.equal((await f.handle(forwarded)).status, 200)
+  assert.deepEqual(f.calls, [['unload', 'qwen']])
+})
+test('missing-Origin requests with missing or forged synchronizer tokens never unload', async () => {
+  const f = fixture()
+  for (const token of ['', 'X'.repeat(43), 'short', 'X'.repeat(44)]) {
+    const forwarded = request({}, { headers: { 'x-dsh-csrf-token': token } })
+    forwarded.headers.delete('origin')
+    assert.equal((await f.handle(forwarded)).status, 403)
+  }
+  assert.deepEqual(f.calls, [])
+})
+test('tokens are rotated with the handler and never accepted by another instance', async () => {
+  const f = fixture()
+  const next = createLocalModelHandler(f.gate)
+  const state = await (await next(new Request('http://localhost/api/dsh-local-model'))).json()
+  assert.match(state.csrfToken, /^[A-Za-z0-9_-]{43}$/)
+  assert.notEqual(state.csrfToken, TEST_TOKEN)
+  assert.equal((await next(request())).status, 403)
+  assert.deepEqual(f.calls, [])
 })
 test('invalid or force bodies and arbitrary backend URLs are rejected', async () => {
   const f = fixture()

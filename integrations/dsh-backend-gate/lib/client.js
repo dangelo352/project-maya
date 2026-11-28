@@ -269,26 +269,40 @@ var noticeDurationMs = 15e3;
 var unloadSlot = "conversation.input.model.options";
 var localBackends = /* @__PURE__ */ new Set(["qwen", "maya", "hyperinkling"]);
 var warning = "Unload all local GPU models. Normal requests and goals may reload them.";
-async function requestLocalModels(fetchImpl, { sessionId, signal, unload = false } = {}) {
+async function requestLocalModels(fetchImpl, { sessionId, signal, unload = false, csrfToken } = {}) {
+  const freshToken = async () => {
+    const snapshot = await requestLocalModels(fetchImpl, { signal });
+    if (typeof snapshot.csrfToken !== "string" || !snapshot.csrfToken.trim()) {
+      throw new Error("Local model endpoint did not provide a CSRF token. Refresh status and retry.");
+    }
+    return snapshot.csrfToken;
+  };
   const options = { method: unload ? "POST" : "GET", credentials: "same-origin", cache: "no-store", signal };
   if (unload) {
-    options.headers = { "Content-Type": "application/json" };
+    const token = typeof csrfToken === "string" && csrfToken.trim() ? csrfToken : await freshToken();
+    options.headers = { "Content-Type": "application/json", "x-dsh-csrf-token": token };
     options.body = JSON.stringify({ backend: "all", ...sessionId ? { sessionId } : {} });
   }
-  const response = await fetchImpl(localModelRoute, options);
-  let data;
-  try {
-    data = await response.json();
-  } catch {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await fetchImpl(localModelRoute, options);
+    let data;
+    try {
+      data = await response.json();
+    } catch {
+    }
+    if (unload && attempt === 0 && response.status === 403 && data?.error === "csrf_token_required") {
+      options.headers = { ...options.headers, "x-dsh-csrf-token": await freshToken() };
+      continue;
+    }
+    if (!response.ok || data?.ok !== true) {
+      const message = data?.message || data?.error || `Local model endpoint returned HTTP ${response.status}`;
+      throw new Error(response.status === 409 ? `Local models are busy. ${message}` : message);
+    }
+    if (unload && !["unloaded", "already_idle"].includes(data.status)) {
+      throw new Error("Local model endpoint did not confirm unload. Check status and retry.");
+    }
+    return data;
   }
-  if (!response.ok || data?.ok !== true) {
-    const message = data?.message || data?.error || `Local model endpoint returned HTTP ${response.status}`;
-    throw new Error(response.status === 409 ? `Local models are busy. ${message}` : message);
-  }
-  if (unload && !["unloaded", "already_idle"].includes(data.status)) {
-    throw new Error("Local model endpoint did not confirm unload. Check status and retry.");
-  }
-  return data;
 }
 function unloadView(snapshot, { inFlight = false, locked = false, notice = null, statusError = null, now = Date.now() } = {}) {
   const backends = (snapshot?.backends || []).filter((item) => localBackends.has(item.backend));
@@ -368,7 +382,7 @@ function mountUnload(React2, slots, fetchImpl = fetch) {
       request.current = controller;
       setInFlight(true);
       try {
-        await requestLocalModels(fetchImpl, { unload: true, sessionId: sessionId || boundSessionId, signal: controller.signal });
+        await requestLocalModels(fetchImpl, { unload: true, sessionId: sessionId || boundSessionId, signal: controller.signal, csrfToken: snapshot?.csrfToken });
         if (mounted.current) {
           setSnapshot((previous) => ({
             ...previous,

@@ -9,7 +9,8 @@
     "./client": "./lib/client.js",
     "./package.json": "./package.json",
     "./recovery": "./lib/recovery.js",
-    "./memory-controls": "./lib/memory-controls.js"
+    "./memory-controls": "./lib/memory-controls.js",
+    "./memory-controls-v2": "./lib/memory-controls-v2.js"
   },
   "scripts": {
     "bundle:client": "node ./scripts/bundle-client.mjs",
