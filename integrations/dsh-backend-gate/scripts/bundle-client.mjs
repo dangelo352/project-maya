@@ -17,8 +17,7 @@ const bundle = `window.__ModuleLoader__.load({\n`
   + body
   + `\n    return module.exports;\n  },\n});\n`
 
-mkdirSync('lib', { recursive: true })
-writeFileSync('lib/client.js', bundle)
+const checkOnly = process.argv.includes('--check')
 
 const box = { registration: null }
 const fakeWindow = { __ModuleLoader__: { load: value => { box.registration = value } } }
@@ -26,6 +25,7 @@ const fakeReact = {
   createElement: () => null,
   useState: value => [value, () => {}],
   useEffect: () => {},
+  useRef: value => ({ current: value }),
 }
 new Script(bundle).runInNewContext({
   window: fakeWindow,
@@ -37,24 +37,31 @@ const face = box.registration.factory(id => id === 'react' ? fakeReact : (() => 
 if (face.name !== 'maya-model-switch-card' || typeof face.apply !== 'function') {
   throw new Error('client bundle does not expose the DSH client plugin face')
 }
-let slotRegistered = false
+const registeredSlots = new Set()
+const expectedSlots = { 'maya-model-switch-card': 'conversation.input.dock', 'maya-model-unload': 'conversation.input.model.options' }
 face.apply({
   inject(names, callback) {
     if (JSON.stringify(names) !== JSON.stringify(['slots', 'sessions'])) throw new Error('unexpected client injection')
     callback({
       slots: {
         inject(name, register) {
-          if (name !== 'conversation.input.dock') throw new Error(`unexpected slot ${name}`)
+          if (!Object.values(expectedSlots).includes(name)) throw new Error(`unexpected slot ${name}`)
           register()
         },
         register(options, component) {
-          if (options.id !== 'maya-model-switch-card' || typeof component !== 'function') throw new Error('invalid composer card registration')
-          slotRegistered = true
+          if (options.name !== expectedSlots[options.id] || typeof component !== 'function') throw new Error('invalid composer/menu registration')
+          if (registeredSlots.has(options.id)) throw new Error('duplicate composer slot')
+          registeredSlots.add(options.id)
+          component({ sessionId: 'smoke-session', useSession: selector => selector({ running: false, sessionId: 'smoke-session' }) })
         },
       },
       sessions: { binding: () => ({ session: { cancel: async () => ({ ok: true, value: { accepted: true } }) } }) },
     })
   },
 })
-if (!slotRegistered) throw new Error('client plugin did not register its composer card')
-console.log(`built and smoke-checked lib/client.js (${bundle.length} bytes)`)
+if (registeredSlots.size !== 2) throw new Error('client plugin did not register the composer card and model-menu control')
+if (!checkOnly) {
+  mkdirSync('lib', { recursive: true })
+  writeFileSync('lib/client.js', bundle)
+}
+console.log(`${checkOnly ? 'checked' : 'built'} and smoke-checked composer card and model-menu slot (${bundle.length} bytes)`)

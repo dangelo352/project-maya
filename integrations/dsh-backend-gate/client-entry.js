@@ -1,5 +1,6 @@
 import React from 'react'
 import { mount } from './client-src.js'
+import { mountUnload } from './unload-client.js'
 
 export const name = 'maya-model-switch-card'
 export const inject = []
@@ -14,6 +15,7 @@ export function apply(ctx) {
       },
     }
     mount(React, clientCtx.slots, sessionActions, fetch, clientCtx.sessions)
+    mountUnload(React, clientCtx.slots, fetch)
   })
 }
 

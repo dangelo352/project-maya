@@ -3,6 +3,7 @@
 import { spawn } from 'node:child_process'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { createLocalModelHandler, LOCAL_MODEL_ROUTE } from './local-model-control.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -121,10 +122,12 @@ export function createBackendClients({
   mayaHost = '127.0.0.1',
   mayaPort = 18022,
   pollIntervalMs = 2_000,
+  qwenMetricsUrl = 'http://127.0.0.1:18020/metrics',
+  qwenQueueUrl = 'http://127.0.0.1:18026/priority/queue',
 } = {}) {
-  async function hyperinklingState() {
+  async function hyperinklingState(requestTimeoutMs = timeoutMs) {
     try {
-      const status = await requestJson(fetchImpl, `${urls.hyperinkling}/is_sleeping`, {}, timeoutMs)
+      const status = await requestJson(fetchImpl, `${urls.hyperinkling}/is_sleeping`, {}, requestTimeoutMs)
       if (typeof status?.is_sleeping !== 'boolean') {
         throw new Error('HyperInkling /is_sleeping returned no boolean is_sleeping field')
       }
@@ -134,7 +137,7 @@ export function createBackendClients({
       // failed during WSL startup. A successful health probe is the loaded
       // state; switching away stops the service to release the single GPU.
       if (!/HTTP 404\b/.test(error.message)) throw error
-      await requestJson(fetchImpl, `${urls.hyperinkling}/health`, {}, timeoutMs)
+      await requestJson(fetchImpl, `${urls.hyperinkling}/health`, {}, requestTimeoutMs)
       return { sleeping: false }
     }
   }
@@ -197,15 +200,35 @@ export function createBackendClients({
   }
 
   return {
+    async activity(backend, requestTimeoutMs = 1500) {
+      if (backend === 'maya') {
+        const value = await requestJson(fetchImpl, `${urls.maya}/status`, {}, requestTimeoutMs)
+        if (typeof value.busy !== 'boolean' || !Number.isFinite(value.queued)) throw new Error('Maya activity status is unavailable.')
+        return { busy: value.busy || value.queued > 0 }
+      }
+      const response = await fetchImpl(backend === 'qwen' ? qwenMetricsUrl : `${urls.hyperinkling}/metrics`, { signal: AbortSignal.timeout(requestTimeoutMs) })
+      if (!response.ok) throw new Error('Engine activity metrics are unavailable.')
+      const activity = parseEngineActivity(await response.text())
+      if (backend === 'qwen' && qwenQueueUrl) {
+        try {
+          const queue = await requestJson(fetchImpl, qwenQueueUrl, {}, requestTimeoutMs)
+          if (!Array.isArray(queue.queue)) throw new Error('Qwen scheduler status is unavailable.')
+          activity.busy ||= Boolean(queue.active) || queue.queue.length > 0
+        } catch (error) {
+          if (!isConnectionError(error) && !/HTTP 404\b/.test(error.message)) throw error
+        }
+      }
+      return activity
+    },
     async status(backend, requestTimeoutMs = timeoutMs) {
-      if (backend === 'hyperinkling') return hyperinklingState()
+      if (backend === 'hyperinkling') return hyperinklingState(requestTimeoutMs)
       const path = backend === 'maya' ? '/health' : '/status'
       return requestJson(fetchImpl, `${urls[backend]}${path}`, {}, requestTimeoutMs)
     },
-    async loaded(backend) {
+    async loaded(backend, requestTimeoutMs = timeoutMs) {
       let status
       try {
-        status = await this.status(backend)
+        status = await this.status(backend, requestTimeoutMs)
       } catch (error) {
         // Local backends may be stopped between sessions. Treat a refused
         // connection as idle so bootstrap can still route to another model.
@@ -308,6 +331,8 @@ export class BackendGate {
     this.timeoutMs = timeoutMs
     this.currentBackend = null
     this.activeRequests = 0
+    this.pendingRequests = 0
+    this.manualUnload = { phase: 'idle' }
     this.transitioning = false
     this.waiters = new Set()
     this.selectionRevision = 0
@@ -452,6 +477,13 @@ export class BackendGate {
   }
 
   async acquire(provider, sessionId, model) {
+    if (this.backendFor(provider) === null) return () => {}
+    this.pendingRequests += 1
+    try { return await this.acquireLease(provider, sessionId, model) }
+    finally { this.pendingRequests -= 1 }
+  }
+
+  async acquireLease(provider, sessionId, model) {
     const target = this.backendFor(provider)
     if (target === null) return () => {}
 
@@ -500,6 +532,64 @@ export class BackendGate {
     this.activeSessions.set(key, (this.activeSessions.get(key) ?? 0) + 1)
   }
 
+  async localStatusSnapshot() {
+    const backends = await Promise.all(Object.keys(BACKEND_URLS).map(async backend => {
+      try {
+        const raw = await this.clients.status(backend, 1200)
+        const info = summarizeBackendStatus(backend, raw)
+        const idleQwen = backend === 'qwen' && !raw?.engine_pid && !raw?.loading_model && !raw?.active_model
+        return { backend, ...info, state: idleQwen ? 'unloaded' : info.state === 'starting' ? 'unknown' : info.state, model: info.model ?? null }
+      } catch (error) {
+        return { backend, state: isConnectionError(error) ? 'offline' : 'unknown', model: null }
+      }
+    }))
+    const activity = await Promise.all(backends.filter(item => ['ready', 'loading'].includes(item.state)).map(async item => {
+      try { return (await this.clients.activity?.(item.backend, 1200))?.busy === true }
+      catch { return true }
+    }))
+    const backendBusy = activity.some(Boolean)
+    return { ok: true, currentBackend: this.currentBackend, activeRequests: this.activeRequests, backendBusy,
+      pendingRequests: this.pendingRequests, transitioning: this.transitioning,
+      unload: { ...this.manualUnload }, backends }
+  }
+
+  async unloadIdle(backend = 'all', sessionId) {
+    if (backend !== 'all' && !Object.hasOwn(BACKEND_URLS, backend)) throw Object.assign(new Error('Unknown local backend.'), { code: 'invalid_backend' })
+    if (this.activeRequests > 0 || this.pendingRequests > 0 || this.transitioning) {
+      throw Object.assign(new Error('Local inference or a model switch is active. Wait for it to finish before unloading.'), { code: 'busy' })
+    }
+    // Acquire synchronously before any backend probe; new requests must wait for this handoff.
+    this.transitioning = true
+    ++this.selectionRevision
+    this.manualUnload = { phase: 'unloading', startedAt: Date.now(), backend, sessionId }
+    const unloaded = []
+    try {
+      const resident = []
+      for (const target of backend === 'all' ? Object.keys(BACKEND_URLS) : [backend]) {
+        if (!await this.clients.loaded(target, 5000)) continue
+        resident.push(target)
+        if ((await this.clients.activity?.(target, 2000))?.busy)
+          throw Object.assign(new Error(`${target} is still processing or has queued work. Wait before unloading.`), { code: 'busy' })
+      }
+      for (const target of resident) {
+        await this.clients.unload(target)
+        if (await this.clients.loaded(target, 5000)) throw new Error(`${target} still reports a resident model after unload.`)
+        unloaded.push(target)
+        if (this.currentBackend === target) this.currentBackend = null
+      }
+      if (backend === 'all') this.currentBackend = null
+      const status = unloaded.length ? 'unloaded' : 'already_idle'
+      this.manualUnload = { ...this.manualUnload, phase: 'unloaded', finishedAt: Date.now(), status, unloaded }
+      return { ok: true, status, unloaded }
+    } catch (error) {
+      this.manualUnload = { ...this.manualUnload, phase: 'error', error: error?.message ?? String(error), unloaded, finishedAt: Date.now() }
+      throw error
+    } finally {
+      this.transitioning = false
+      this.notify()
+    }
+  }
+
   releaseOnce(sessionId, alreadyAdded = false) {
     if (!alreadyAdded) this.addActiveSession(sessionId)
     let released = false
@@ -546,6 +636,19 @@ export function summarizeBackendStatus(name, status) {
     }
   }
   return { state: status.sleeping === false ? 'ready' : status.sleeping === true ? 'sleeping' : 'starting' }
+}
+
+export function parseEngineActivity(text) {
+  const values = { running: null, waiting: null }
+  for (const line of text.split(/\r?\n/)) {
+    const match = /^vllm:num_requests_(running|waiting)(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/.exec(line)
+    if (!match) continue
+    const value = Number(match[2])
+    if (!Number.isFinite(value) || value < 0) throw new Error('Invalid engine activity metric.')
+    values[match[1]] = (values[match[1]] ?? 0) + value
+  }
+  if (values.running === null || values.waiting === null) throw new Error('Engine activity metrics are incomplete.')
+  return { ...values, busy: values.running > 0 || values.waiting > 0 }
 }
 
 export function createSwitchStatusHandler(gate) {
@@ -597,6 +700,12 @@ export function apply(ctx, config = {}) {
       requestBody: 'buffered',
       fetch: createSwitchStatusHandler(gate),
     }), 'Live local-model switch status')
+    connectionCtx.effect(() => registry.register({
+      path: LOCAL_MODEL_ROUTE,
+      methods: ['GET', 'POST'],
+      requestBody: 'buffered',
+      fetch: createLocalModelHandler(gate),
+    }), 'Local model unload controls')
   })
   return gate
 }
