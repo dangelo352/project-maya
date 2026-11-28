@@ -4,9 +4,9 @@ export const noticeDurationMs = 15000
 // Declared by dsh-client-ui-model-selection/src/client/slots.ts and rendered in ModelSelect's root menu.
 export const unloadSlot = 'conversation.input.model.options'
 const localBackends = new Set(['qwen', 'maya', 'hyperinkling'])
-const warning = 'Unload all local GPU models. Normal requests and goals may reload them.'
+const warning = 'Unload all local GPU models. Normal unload keeps Qwen weights in RAM for fast resume; Maya and Hyperinkling fall back to cold unload. Fully unload stops the engine and releases model RAM. Normal requests and goals may reload them.'
 
-export async function requestLocalModels(fetchImpl, { sessionId, signal, unload = false, csrfToken } = {}) {
+export async function requestLocalModels(fetchImpl, { sessionId, signal, unload = false, mode = 'normal', csrfToken } = {}) {
   const freshToken = async () => {
     const snapshot = await requestLocalModels(fetchImpl, { signal })
     if (typeof snapshot.csrfToken !== 'string' || !snapshot.csrfToken.trim()) {
@@ -18,7 +18,7 @@ export async function requestLocalModels(fetchImpl, { sessionId, signal, unload 
   if (unload) {
     const token = typeof csrfToken === 'string' && csrfToken.trim() ? csrfToken : await freshToken()
     options.headers = { 'Content-Type': 'application/json', 'x-dsh-csrf-token': token }
-    options.body = JSON.stringify({ backend: 'all', ...(sessionId ? { sessionId } : {}) })
+    options.body = JSON.stringify({ backend: 'all', mode, ...(sessionId ? { sessionId } : {}) })
   }
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const response = await fetchImpl(localModelRoute, options)
@@ -47,16 +47,17 @@ export function unloadView(snapshot, { inFlight = false, locked = false, notice 
     || snapshot?.activeRequests > 0 || snapshot?.pendingRequests > 0
   const recent = notice && now - notice.at < noticeDurationMs ? notice : null
   // A fresh ready/loading state supersedes a previous success: a request may have reloaded it.
-  const success = recent?.kind === 'success' && backends.every(item => ['offline', 'unloaded', 'sleeping'].includes(item.state))
+  const success = recent?.kind === 'success' && backends.every(item => (recent.mode === 'full' ? ['offline', 'unloaded', 'sleeping'] : ['offline', 'unloaded', 'sleeping', 'parked']).includes(item.state))
   const error = recent?.kind === 'error' ? recent.message : statusError ||
     (snapshot?.unload?.phase === 'error' ? snapshot.unload.error || 'Unload failed. Retry when idle.' : null)
-  const states = backends.map(item => `${{ qwen: 'Qwen', maya: 'Maya', hyperinkling: 'Hyperinkling' }[item.backend]}: ${item.state || 'unknown'}`).join(' · ')
+  const states = backends.map(item => `${{ qwen: 'Qwen', maya: 'Maya', hyperinkling: 'Hyperinkling' }[item.backend]}: ${item.backend === 'qwen' && item.state === 'parked' ? 'ready in RAM' : item.state || 'unknown'}`).join(' · ')
   return {
     visible: inFlight || !hidden || !!recent,
     disabled: busy || !!statusError || !snapshot || hidden,
     busy,
     label: error ? `Unload unavailable: ${error}` : inFlight || snapshot?.unload?.phase === 'unloading'
-      ? 'Unloading local models…' : success ? 'Model unloaded · next request reloads' : states || 'Local models unavailable',
+      ? 'Unloading local models…' : success && !backends.some(item => item.state === 'parked')
+        ? recent.mode === 'full' ? 'Fully unloaded · model RAM released' : 'Model unloaded · next request resumes or reloads' : states || 'Local models unavailable',
     error: !!error,
     title: `${error ? `${error} ` : ''}${warning}${busy ? ' Waiting for local backend work to finish.' : ''}`,
   }
@@ -116,19 +117,17 @@ export function mountUnload(React, slots, fetchImpl = fetch) {
       return () => clearTimeout(timer)
     }, [notice])
 
-    const view = unloadView(snapshot, { inFlight, locked, notice, statusError })
-    const unload = async () => {
+    const view = unloadView(snapshot, { inFlight: !!inFlight, locked, notice, statusError })
+    const unload = async (mode = 'normal') => {
       if (request.current || view.disabled) return
       const controller = new AbortController()
       request.current = controller
-      setInFlight(true)
+      setInFlight(mode)
       try {
-        await requestLocalModels(fetchImpl, { unload: true, sessionId: sessionId || boundSessionId, signal: controller.signal, csrfToken: snapshot?.csrfToken })
+        await requestLocalModels(fetchImpl, { unload: true, mode, sessionId: sessionId || boundSessionId, signal: controller.signal, csrfToken: snapshot?.csrfToken })
         if (mounted.current) {
-          setSnapshot(previous => ({ ...previous, unload: { phase: 'unloaded' },
-            backends: (previous?.backends || []).map(item => localBackends.has(item.backend)
-              ? { ...item, state: item.state === 'offline' ? 'offline' : 'unloaded' } : item) }))
-          setNotice({ kind: 'success', at: Date.now() })
+          // Poll the actual backend state: normal Qwen unload may park weights in RAM.
+          setNotice({ kind: 'success', mode, at: Date.now() })
           setStatusError(null)
         }
       } catch (error) {
@@ -150,13 +149,16 @@ export function mountUnload(React, slots, fetchImpl = fetch) {
         fontFamily: 'var(--dsw-font-family)',
         color: 'var(--dsw-alias-label-secondary)', fontSize: 12, lineHeight: '18px' },
     },
-    h('button', { type: 'button', role: 'menuitem', disabled: view.disabled, onClick: unload,
-      'aria-label': 'Unload model — all local GPU backends', 'aria-busy': inFlight, title: view.title,
+    ...['normal', 'full'].map(mode => h('button', { key: mode, type: 'button', role: 'menuitem', disabled: view.disabled,
+      onClick: () => unload(mode),
+      'aria-label': mode === 'full' ? 'Fully unload — all local GPU backends; release model RAM' : 'Unload model — all local GPU backends; Qwen fast resume',
+      'aria-busy': inFlight === mode,
+      title: mode === 'full' ? 'Stop local engines and release model RAM. Next request cold loads the model.' : view.title,
       style: { font: 'inherit', fontSize: 13, lineHeight: '20px', textAlign: 'left',
-        color: view.disabled ? 'var(--dsw-alias-label-dimmed)' : 'var(--dsw-alias-label-primary)',
+        color: view.disabled ? 'var(--dsw-alias-label-dimmed)' : mode === 'full' ? 'var(--dsw-alias-label-secondary)' : 'var(--dsw-alias-label-primary)',
         border: 0, borderRadius: 'var(--dsw-radius-md)', padding: '7px 8px', minHeight: 34,
         width: '100%', maxWidth: '100%', cursor: view.disabled ? 'default' : 'pointer' },
-    }, inFlight ? 'Unloading…' : 'Unload model'),
+    }, inFlight === mode ? 'Unloading…' : mode === 'full' ? 'Fully unload · release RAM' : 'Unload model')),
     h('span', { role: 'status', 'aria-live': 'polite', style: { minWidth: 0, padding: '0 8px 4px',
       overflowWrap: 'anywhere', color: view.error ? 'var(--dsw-alias-state-error-primary)' : 'inherit' } }, view.label),
     h('style', null, '[data-maya-model-unload] button{background:transparent}[data-maya-model-unload] button:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-hover)}[data-maya-model-unload] button:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:-2px}'))

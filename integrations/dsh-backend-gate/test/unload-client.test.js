@@ -29,8 +29,8 @@ test('read-only status and explicit all-local unload use same-origin route and o
   for (const [, options] of calls) {
     assert.equal(Object.keys(options.headers || {}).some(name => ['origin', 'host', 'sec-fetch-site'].includes(name.toLowerCase())), false)
   }
-  assert.deepEqual(JSON.parse(calls[1][1].body), { backend: 'all', sessionId: 'session / one' })
-  assert.deepEqual(JSON.parse(calls[2][1].body), { backend: 'all' })
+  assert.deepEqual(JSON.parse(calls[1][1].body), { backend: 'all', mode: 'normal', sessionId: 'session / one' })
+  assert.deepEqual(JSON.parse(calls[2][1].body), { backend: 'all', mode: 'normal' })
 })
 
 test('idle sessions still expose ready action; all actual backend states are labeled', () => {
@@ -62,7 +62,7 @@ test('manual success/error stays visible briefly; fresh backend state supersedes
   const notice = { kind: 'success', at: 100 }
   const view = unloadView(snapshot('unloaded'), { notice, now: 101 })
   assert.equal(view.visible, true)
-  assert.equal(view.label, 'Model unloaded · next request reloads')
+  assert.equal(view.label, 'Model unloaded · next request resumes or reloads')
   assert.equal(view.disabled, true)
   assert.equal(unloadView(snapshot(), { notice, now: 101 }).label, 'Qwen: ready')
   assert.equal(unloadView(snapshot('unloaded'), { notice, now: 100 + noticeDurationMs }).visible, false)
@@ -213,7 +213,7 @@ test('component polls, unloads only on click, suppresses duplicate clicks, and c
     assert.deepEqual(calls.map(call => call.method), ['GET', 'POST'])
     assert.equal(ui.render().props['aria-busy'], true)
     complete(); await pending; await settle()
-    assert.equal(ui.render().children[1].children[0], 'Model unloaded · next request reloads')
+    assert.equal(ui.render().children[2].children[0], 'Model unloaded · next request resumes or reloads')
     assert.equal(pollIntervalMs, 4000)
   } finally { ui.cleanup() }
   assert.equal(calls.at(-1).signal.aborted, true)
@@ -229,8 +229,8 @@ test('component shows POST errors and uses session hook when prop absent', async
   try {
     ui.render(); await settle()
     await ui.render().children[0].props.onClick(); await settle()
-    assert.deepEqual(post, { backend: 'all', sessionId: 'bound-session' })
-    assert.match(ui.render().children[1].children[0], /busy.*Try after request/)
+    assert.deepEqual(post, { backend: 'all', mode: 'normal', sessionId: 'bound-session' })
+    assert.match(ui.render().children[2].children[0], /busy.*Try after request/)
     assert.deepEqual(failures, ['Local models are busy. Try after request'])
   } finally { ui.cleanup() }
 })
@@ -261,4 +261,63 @@ test('React bundle registers both native slots without changing tracked output',
   const result = execFileSync(process.execPath, ['scripts/bundle-client.mjs', '--check'], { cwd: new URL('..', import.meta.url), encoding: 'utf8' })
   assert.match(result, /smoke-checked composer card and model-menu slot/)
   assert.deepEqual(readFileSync(output), before)
+})
+
+
+test('full unload sends explicit mode and preserves it through the single CSRF retry', async () => {
+  const calls = []
+  await requestLocalModels(async (_, options) => {
+    calls.push({ ...options, headers: { ...options.headers } })
+    if (options.method === 'GET') return response(snapshot())
+    return calls.length === 1 ? response({ ok: false, error: 'csrf_token_required' }, 403)
+      : response({ ok: true, status: 'unloaded' })
+  }, { unload: true, mode: 'full', sessionId: 'full-session', csrfToken: 'stale' })
+  assert.deepEqual(calls.map(call => call.method), ['POST', 'GET', 'POST'])
+  for (const call of [calls[0], calls[2]]) {
+    assert.deepEqual(JSON.parse(call.body), { backend: 'all', mode: 'full', sessionId: 'full-session' })
+  }
+})
+
+test('parked Qwen truthfully shows RAM residency and keeps full unload available', () => {
+  const view = unloadView(snapshot('parked'), { notice: { kind: 'success', mode: 'normal', at: 100 }, now: 101 })
+  assert.equal(view.visible, true)
+  assert.equal(view.disabled, false)
+  assert.equal(view.label, 'Qwen: ready in RAM')
+  assert.match(view.title, /Qwen weights in RAM for fast resume/)
+  assert.match(view.title, /Maya and Hyperinkling fall back to cold unload/)
+  assert.equal(unloadView(snapshot('parked'), { notice: { kind: 'success', mode: 'full', at: 100 }, now: 101 }).label, 'Qwen: ready in RAM')
+  assert.equal(unloadView(snapshot('unloaded'), { notice: { kind: 'success', mode: 'full', at: 100 }, now: 101 }).label, 'Fully unloaded · model RAM released')
+})
+
+test('native menu exposes normal and full actions with shared locking and explicit request modes', async () => {
+  for (const [index, mode] of [[0, 'normal'], [1, 'full']]) {
+    const posts = []
+    let complete
+    const ui = host(async (_, options) => {
+      if (options.method === 'POST') {
+        posts.push(JSON.parse(options.body))
+        return new Promise(resolve => { complete = () => resolve(response({ ok: true, status: 'unloaded' })) })
+      }
+      return response(snapshot('parked'))
+    })
+    try {
+      ui.render(); await settle()
+      const tree = ui.render()
+      assert.equal(tree.children[0].children[0], 'Unload model')
+      assert.equal(tree.children[1].children[0], 'Fully unload · release RAM')
+      assert.equal(tree.children[1].props.role, 'menuitem')
+      assert.match(tree.children[1].props.title, /release model RAM/)
+      const pending = tree.children[index].props.onClick()
+      await tree.children[1 - index].props.onClick()
+      assert.deepEqual(posts, [{ backend: 'all', mode, sessionId: 'composer-session' }])
+      const busy = ui.render()
+      assert.equal(busy.children[0].props.disabled, true)
+      assert.equal(busy.children[1].props.disabled, true)
+      assert.equal(busy.children[index].children[0], 'Unloading…')
+      assert.equal(busy.children[index].props['aria-busy'], true)
+      complete(); await pending; await settle()
+      // A successful POST does not fabricate unloaded state from a still-parked snapshot.
+      assert.equal(ui.render().children[2].children[0], 'Qwen: ready in RAM')
+    } finally { ui.cleanup() }
+  }
 })

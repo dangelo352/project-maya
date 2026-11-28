@@ -55,7 +55,7 @@ var phaseLabels = {
   loading: "Loading selected model",
   ready: "Model is ready",
   error: "Model switch failed",
-  serving: "Model loaded - waiting for engine output",
+  serving: "Model ready - waiting for generation",
   "status-unavailable": "Waiting for backend status - no engine reading available"
 };
 function elapsedLabel(ms) {
@@ -64,6 +64,40 @@ function elapsedLabel(ms) {
 }
 function statusUrl(sessionId) {
   return `${ROUTE}?sessionId=${encodeURIComponent(sessionId)}`;
+}
+function observedSnapshot(data, sessionId, measured, now = Date.now()) {
+  if (data?.sessionId === sessionId) return data;
+  const state = data?.backendStatus?.state;
+  const phase = state === "loading" ? "loading" : state === "ready" ? "serving" : !state && measured && measured.state !== "unavailable" ? "serving" : "status-unavailable";
+  return {
+    sessionId,
+    backend: data?.backend || "local",
+    model: data?.model || "Local inference engine",
+    backendStatus: data?.backendStatus,
+    phase,
+    observed: true,
+    startedAt: now,
+    updatedAt: now
+  };
+}
+function prefillView(snapshot) {
+  const activity = snapshot?.backendStatus?.activity;
+  if (snapshot?.statusUnavailable || activity?.state !== "reading") return null;
+  const processed = activity.prompt_read;
+  const total = activity.prompt_total;
+  const valid = Number.isFinite(processed) && Number.isFinite(total) && processed >= 0 && total > 0 && processed <= total;
+  const rate = activity.prefill_tok_s_mean;
+  const eta = valid && Number.isFinite(rate) && rate > 0 ? (total - processed) / rate : null;
+  const etaSeconds = Number.isFinite(eta) ? Math.ceil(eta) : null;
+  const compactCount = (value) => value >= 1e3 ? `${Math.round(value / 1e3)}K` : String(value);
+  return {
+    processed: valid ? processed : null,
+    total: valid ? total : null,
+    percent: valid ? processed / total * 100 : null,
+    etaSeconds,
+    label: `Prefill ${valid ? `${compactCount(processed)} / ${compactCount(total)}` : "- progress unavailable"}${etaSeconds === null ? "" : ` - ETA ${elapsedLabel(etaSeconds * 1e3)}`}`,
+    title: `${valid ? `Prefill ${processed} / ${total} tokens. ` : ""}Engine activity is shared across sessions.`
+  };
 }
 function compactionLifecycle(entries) {
   const open = /* @__PURE__ */ new Map();
@@ -126,7 +160,14 @@ function mount(React2, slots, remoteSession, fetchImpl = fetch, sessions) {
             signal: controller.signal
           });
           if (!response.ok) throw new Error(`status endpoint returned HTTP ${response.status}`);
-          const data = await response.json();
+          let data = await response.json();
+          if (!data || data.sessionId !== sessionId) {
+            try {
+              const global = await fetchImpl(ROUTE, { cache: "no-store", signal: controller.signal });
+              if (global.ok) data = await global.json() || data;
+            } catch {
+            }
+          }
           let measured = null;
           try {
             const r = await fetchImpl("/api/dsh-server-tps", { cache: "no-store", signal: controller.signal });
@@ -135,20 +176,13 @@ function mount(React2, slots, remoteSession, fetchImpl = fetch, sessions) {
           }
           if (active) {
             setRate(measured);
-            setSnapshot(data?.sessionId === sessionId ? data : {
-              sessionId,
-              backend: "local",
-              model: "Local inference engine",
-              phase: measured && measured.state !== "unavailable" ? "serving" : "status-unavailable",
-              observed: true,
-              startedAt: Date.now(),
-              updatedAt: Date.now()
-            });
+            setSnapshot(observedSnapshot(data, sessionId, measured));
             if (!data || data.sessionId !== sessionId || ["ready", "error"].includes(data.phase)) {
               setCancelState("idle");
             }
           }
         } catch {
+          if (active) setRate(null);
           if (active) setSnapshot((previous) => previous?.sessionId === sessionId ? { ...previous, statusUnavailable: true } : null);
         } finally {
           clearTimeout(requestTimeout);
@@ -177,10 +211,11 @@ function mount(React2, slots, remoteSession, fetchImpl = fetch, sessions) {
     }, [snapshot?.startedAt]);
     const compacting = compaction && ["compacting", "saving-summary"].includes(compaction.phase);
     const recentCompaction = compaction?.finishedAt && clock - compaction.finishedAt < 5e3;
-    const visible = compacting || recentCompaction || snapshot?.sessionId === sessionId && (!snapshot.observed || running || snapshot.phase === "loading");
+    const prefill = running && !compacting && !recentCompaction ? prefillView(snapshot) : null;
+    const visible = prefill || compacting || recentCompaction || snapshot?.sessionId === sessionId && (!snapshot.observed || running || snapshot.phase === "loading");
     if (!visible) return null;
     const status = snapshot || {};
-    const phase = compacting || recentCompaction ? compaction.phase : status.phase;
+    const phase = compacting || recentCompaction ? compaction.phase : prefill ? "prefill" : status.phase;
     const serving = phase === "serving";
     const done = phase === "ready" || serving || phase === "compacted";
     const failed = phase === "error" || phase === "compaction-error";
@@ -215,7 +250,7 @@ function mount(React2, slots, remoteSession, fetchImpl = fetch, sessions) {
       }
     };
     const textColor = failed ? "var(--danger, #ef6262)" : "var(--dsw-alias-label-primary)";
-    const phaseLabel = compacting ? phase === "saving-summary" ? "Saving conversation summary" : "Compacting conversation" : phase === "compacted" ? "Compaction finished" : phase === "compaction-error" ? "Compaction failed" : serving ? rate?.state === "live" ? `Engine generating - ${rate.tps.toFixed(1)} tokens/sec` : "Model loaded - no new engine tokens measured" : phaseLabels[phase] || "Waiting for backend status";
+    const phaseLabel = compacting ? phase === "saving-summary" ? "Saving conversation summary" : "Compacting conversation" : phase === "compacted" ? "Compaction finished" : phase === "compaction-error" ? "Compaction failed" : prefill ? prefill.label : serving ? rate?.state === "live" && Number.isFinite(rate.tps) && !["idle", "unknown"].includes(status.backendStatus?.activity?.state) ? `Engine generating - ${rate.tps.toFixed(1)} tokens/sec` : "Model ready - waiting for generation" : phaseLabels[phase] || "Waiting for backend status";
     const duration = compaction && (compacting || recentCompaction) ? (compaction.finishedAt || clock) - compaction.startedAt : done || failed ? Math.max(0, (status.finishedAt || Date.now()) - (status.startedAt || Date.now())) : elapsed;
     return h(
       "div",
@@ -223,7 +258,7 @@ function mount(React2, slots, remoteSession, fetchImpl = fetch, sessions) {
         "data-maya-model-switch": phase,
         role: "status",
         "aria-live": "polite",
-        title: status.error || `${phaseLabel}${compacting ? " - preserving conversation context" : `. Engine token readings are shared across sessions.`}`,
+        title: status.error || prefill?.title || `${phaseLabel}${compacting ? " - preserving conversation context" : `. Engine token readings are shared across sessions.`}`,
         style: {
           display: "flex",
           alignItems: "center",
@@ -241,7 +276,15 @@ function mount(React2, slots, remoteSession, fetchImpl = fetch, sessions) {
         }
       },
       h("style", null, "[data-chat-running]{display:none!important}@keyframes maya-switch-travel{0%{transform:translateX(-110%)}100%{transform:translateX(285%)}}@media(prefers-reduced-motion:reduce){[data-maya-model-switch] i{animation:none!important}}"),
-      !done && !failed ? h("span", {
+      prefill ? prefill.percent !== null ? h("span", {
+        role: "progressbar",
+        "aria-label": "Prefill - shared engine",
+        "aria-valuemin": 0,
+        "aria-valuemax": prefill.total,
+        "aria-valuenow": prefill.processed,
+        "aria-valuetext": `${prefill.processed} / ${prefill.total} tokens`,
+        style: { width: 42, height: 3, borderRadius: 4, overflow: "hidden", flex: "0 0 auto", background: "var(--dsw-alias-border-l2)" }
+      }, h("i", { style: { display: "block", width: `${prefill.percent}%`, height: "100%", background: "var(--dsw-alias-state-business-primary)" } })) : null : !done && !failed ? h("span", {
         role: "progressbar",
         "aria-label": phaseLabel,
         style: { width: 42, height: 3, borderRadius: 4, overflow: "hidden", flex: "0 0 auto", background: "var(--dsw-alias-border-l2)" }
@@ -268,8 +311,8 @@ var pollIntervalMs = 4e3;
 var noticeDurationMs = 15e3;
 var unloadSlot = "conversation.input.model.options";
 var localBackends = /* @__PURE__ */ new Set(["qwen", "maya", "hyperinkling"]);
-var warning = "Unload all local GPU models. Normal requests and goals may reload them.";
-async function requestLocalModels(fetchImpl, { sessionId, signal, unload = false, csrfToken } = {}) {
+var warning = "Unload all local GPU models. Normal unload keeps Qwen weights in RAM for fast resume; Maya and Hyperinkling fall back to cold unload. Fully unload stops the engine and releases model RAM. Normal requests and goals may reload them.";
+async function requestLocalModels(fetchImpl, { sessionId, signal, unload = false, mode = "normal", csrfToken } = {}) {
   const freshToken = async () => {
     const snapshot = await requestLocalModels(fetchImpl, { signal });
     if (typeof snapshot.csrfToken !== "string" || !snapshot.csrfToken.trim()) {
@@ -281,7 +324,7 @@ async function requestLocalModels(fetchImpl, { sessionId, signal, unload = false
   if (unload) {
     const token = typeof csrfToken === "string" && csrfToken.trim() ? csrfToken : await freshToken();
     options.headers = { "Content-Type": "application/json", "x-dsh-csrf-token": token };
-    options.body = JSON.stringify({ backend: "all", ...sessionId ? { sessionId } : {} });
+    options.body = JSON.stringify({ backend: "all", mode, ...sessionId ? { sessionId } : {} });
   }
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const response = await fetchImpl(localModelRoute, options);
@@ -309,14 +352,14 @@ function unloadView(snapshot, { inFlight = false, locked = false, notice = null,
   const hidden = backends.length === 0 || backends.every((item) => ["offline", "unloaded"].includes(item.state));
   const busy = locked || inFlight || !!snapshot?.backendBusy || !!snapshot?.transitioning || snapshot?.unload?.phase === "unloading" || snapshot?.activeRequests > 0 || snapshot?.pendingRequests > 0;
   const recent = notice && now - notice.at < noticeDurationMs ? notice : null;
-  const success = recent?.kind === "success" && backends.every((item) => ["offline", "unloaded", "sleeping"].includes(item.state));
+  const success = recent?.kind === "success" && backends.every((item) => (recent.mode === "full" ? ["offline", "unloaded", "sleeping"] : ["offline", "unloaded", "sleeping", "parked"]).includes(item.state));
   const error = recent?.kind === "error" ? recent.message : statusError || (snapshot?.unload?.phase === "error" ? snapshot.unload.error || "Unload failed. Retry when idle." : null);
-  const states = backends.map((item) => `${{ qwen: "Qwen", maya: "Maya", hyperinkling: "Hyperinkling" }[item.backend]}: ${item.state || "unknown"}`).join(" \xB7 ");
+  const states = backends.map((item) => `${{ qwen: "Qwen", maya: "Maya", hyperinkling: "Hyperinkling" }[item.backend]}: ${item.backend === "qwen" && item.state === "parked" ? "ready in RAM" : item.state || "unknown"}`).join(" \xB7 ");
   return {
     visible: inFlight || !hidden || !!recent,
     disabled: busy || !!statusError || !snapshot || hidden,
     busy,
-    label: error ? `Unload unavailable: ${error}` : inFlight || snapshot?.unload?.phase === "unloading" ? "Unloading local models\u2026" : success ? "Model unloaded \xB7 next request reloads" : states || "Local models unavailable",
+    label: error ? `Unload unavailable: ${error}` : inFlight || snapshot?.unload?.phase === "unloading" ? "Unloading local models\u2026" : success && !backends.some((item) => item.state === "parked") ? recent.mode === "full" ? "Fully unloaded \xB7 model RAM released" : "Model unloaded \xB7 next request resumes or reloads" : states || "Local models unavailable",
     error: !!error,
     title: `${error ? `${error} ` : ""}${warning}${busy ? " Waiting for local backend work to finish." : ""}`
   };
@@ -375,21 +418,16 @@ function mountUnload(React2, slots, fetchImpl = fetch) {
       const timer = setTimeout(() => setNotice(null), Math.max(0, notice.at + noticeDurationMs - Date.now()));
       return () => clearTimeout(timer);
     }, [notice]);
-    const view = unloadView(snapshot, { inFlight, locked, notice, statusError });
-    const unload = async () => {
+    const view = unloadView(snapshot, { inFlight: !!inFlight, locked, notice, statusError });
+    const unload = async (mode = "normal") => {
       if (request.current || view.disabled) return;
       const controller = new AbortController();
       request.current = controller;
-      setInFlight(true);
+      setInFlight(mode);
       try {
-        await requestLocalModels(fetchImpl, { unload: true, sessionId: sessionId || boundSessionId, signal: controller.signal, csrfToken: snapshot?.csrfToken });
+        await requestLocalModels(fetchImpl, { unload: true, mode, sessionId: sessionId || boundSessionId, signal: controller.signal, csrfToken: snapshot?.csrfToken });
         if (mounted.current) {
-          setSnapshot((previous) => ({
-            ...previous,
-            unload: { phase: "unloaded" },
-            backends: (previous?.backends || []).map((item) => localBackends.has(item.backend) ? { ...item, state: item.state === "offline" ? "offline" : "unloaded" } : item)
-          }));
-          setNotice({ kind: "success", at: Date.now() });
+          setNotice({ kind: "success", mode, at: Date.now() });
           setStatusError(null);
         }
       } catch (error) {
@@ -427,20 +465,21 @@ function mountUnload(React2, slots, fetchImpl = fetch) {
           lineHeight: "18px"
         }
       },
-      h("button", {
+      ...["normal", "full"].map((mode) => h("button", {
+        key: mode,
         type: "button",
         role: "menuitem",
         disabled: view.disabled,
-        onClick: unload,
-        "aria-label": "Unload model \u2014 all local GPU backends",
-        "aria-busy": inFlight,
-        title: view.title,
+        onClick: () => unload(mode),
+        "aria-label": mode === "full" ? "Fully unload \u2014 all local GPU backends; release model RAM" : "Unload model \u2014 all local GPU backends; Qwen fast resume",
+        "aria-busy": inFlight === mode,
+        title: mode === "full" ? "Stop local engines and release model RAM. Next request cold loads the model." : view.title,
         style: {
           font: "inherit",
           fontSize: 13,
           lineHeight: "20px",
           textAlign: "left",
-          color: view.disabled ? "var(--dsw-alias-label-dimmed)" : "var(--dsw-alias-label-primary)",
+          color: view.disabled ? "var(--dsw-alias-label-dimmed)" : mode === "full" ? "var(--dsw-alias-label-secondary)" : "var(--dsw-alias-label-primary)",
           border: 0,
           borderRadius: "var(--dsw-radius-md)",
           padding: "7px 8px",
@@ -449,7 +488,7 @@ function mountUnload(React2, slots, fetchImpl = fetch) {
           maxWidth: "100%",
           cursor: view.disabled ? "default" : "pointer"
         }
-      }, inFlight ? "Unloading\u2026" : "Unload model"),
+      }, inFlight === mode ? "Unloading\u2026" : mode === "full" ? "Fully unload \xB7 release RAM" : "Unload model")),
       h("span", { role: "status", "aria-live": "polite", style: {
         minWidth: 0,
         padding: "0 8px 4px",

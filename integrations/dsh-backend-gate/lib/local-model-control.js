@@ -38,12 +38,13 @@ export function createLocalModelHandler(gate, { csrfToken = randomBytes(32).toSt
       body = JSON.parse(text)
     } catch { return json({ ok: false, error: 'invalid_json' }, 400) }
     if (!body || typeof body !== 'object' || Array.isArray(body)
-      || Object.keys(body).some(key => !['backend', 'sessionId'].includes(key))
+      || Object.keys(body).some(key => !['backend', 'sessionId', 'mode'].includes(key))
       || (Object.hasOwn(body, 'backend') && typeof body.backend !== 'string')
       || !BACKENDS.has(body.backend ?? 'all')
+      || (Object.hasOwn(body, 'mode') && !['normal', 'full'].includes(body.mode))
       || (body.sessionId !== undefined && (typeof body.sessionId !== 'string' || body.sessionId.length > 256)))
       return json({ ok: false, error: 'invalid_request' }, 400)
-    try { return json(await gate.unloadIdle(body.backend ?? 'all', body.sessionId)) }
+    try { return json(await gate.unloadIdle(body.backend ?? 'all', body.sessionId, body.mode ?? 'normal')) }
     catch (error) {
       const busy = error?.code === 'busy'
       return json({ ok: false, error: busy ? 'busy' : 'unload_failed', message: error?.message ?? String(error),

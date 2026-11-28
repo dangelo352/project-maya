@@ -3,7 +3,7 @@
 import { spawn } from 'node:child_process'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { createLocalModelHandler, LOCAL_MODEL_ROUTE } from './local-model-control.js?csrf=20261127'
+import { createLocalModelHandler, LOCAL_MODEL_ROUTE } from './local-model-control.js?warm-resume=20261127'
 
 const execFileAsync = promisify(execFile)
 
@@ -222,8 +222,16 @@ export function createBackendClients({
     },
     async status(backend, requestTimeoutMs = timeoutMs) {
       if (backend === 'hyperinkling') return hyperinklingState(requestTimeoutMs)
-      const path = backend === 'maya' ? '/health' : '/status'
-      return requestJson(fetchImpl, `${urls[backend]}${path}`, {}, requestTimeoutMs)
+      if (backend === 'maya') {
+        const [health, metrics] = await Promise.all([
+          requestJson(fetchImpl, `${urls.maya}/health`, {}, requestTimeoutMs),
+          requestJson(fetchImpl, `${urls.maya}/metrics`, {}, requestTimeoutMs).catch(() => null),
+        ])
+        // Only live activity leaves this boundary; metrics history and log tails stay private.
+        const { activity } = summarizeBackendStatus('maya', { ...health, live: metrics?.live })
+        return { ...health, ...(activity ? { activity } : {}) }
+      }
+      return requestJson(fetchImpl, `${urls[backend]}/status`, {}, requestTimeoutMs)
     },
     async loaded(backend, requestTimeoutMs = timeoutMs) {
       let status
@@ -288,8 +296,12 @@ export function createBackendClients({
         if ((await hyperinklingState()).sleeping) throw new Error('HyperInkling remained asleep after wake_up')
       }
     },
-    async unload(backend) {
+    async unload(backend, mode = 'normal') {
       if (backend === 'hyperinkling') {
+        if (mode === 'full') {
+          await stopService({ distro, unit: serviceUnit })
+          return { status: 'stopped' }
+        }
         try {
           await requestJson(fetchImpl, `${urls.hyperinkling}/sleep?level=1&mode=wait`, { method: 'POST' }, timeoutMs)
           return { status: 'sleeping' }
@@ -300,7 +312,7 @@ export function createBackendClients({
         }
       }
       const path = backend === 'maya' ? '/models/unload' : '/unload'
-      const body = backend === 'maya' ? {} : undefined
+      const body = backend === 'maya' ? {} : { mode }
       let result
       try {
         result = await requestJson(fetchImpl, `${urls[backend]}${path}`, {
@@ -537,7 +549,7 @@ export class BackendGate {
       try {
         const raw = await this.clients.status(backend, 1200)
         const info = summarizeBackendStatus(backend, raw)
-        const idleQwen = backend === 'qwen' && !raw?.engine_pid && !raw?.loading_model && !raw?.active_model
+        const idleQwen = backend === 'qwen' && !raw?.engine_pid && !raw?.loading_model && !raw?.active_model && !raw?.parked_model
         return { backend, ...info, state: idleQwen ? 'unloaded' : info.state === 'starting' ? 'unknown' : info.state, model: info.model ?? null }
       } catch (error) {
         return { backend, state: isConnectionError(error) ? 'offline' : 'unknown', model: null }
@@ -553,27 +565,37 @@ export class BackendGate {
       unload: { ...this.manualUnload }, backends }
   }
 
-  async unloadIdle(backend = 'all', sessionId) {
+  async unloadIdle(backend = 'all', sessionId, mode = 'normal') {
     if (backend !== 'all' && !Object.hasOwn(BACKEND_URLS, backend)) throw Object.assign(new Error('Unknown local backend.'), { code: 'invalid_backend' })
+    if (!['normal', 'full'].includes(mode)) throw Object.assign(new Error('Invalid unload mode.'), { code: 'invalid_mode' })
     if (this.activeRequests > 0 || this.pendingRequests > 0 || this.transitioning) {
       throw Object.assign(new Error('Local inference or a model switch is active. Wait for it to finish before unloading.'), { code: 'busy' })
     }
     // Acquire synchronously before any backend probe; new requests must wait for this handoff.
     this.transitioning = true
     ++this.selectionRevision
-    this.manualUnload = { phase: 'unloading', startedAt: Date.now(), backend, sessionId }
+    this.manualUnload = { phase: 'unloading', startedAt: Date.now(), backend, sessionId, mode }
     const unloaded = []
     try {
       const resident = []
       for (const target of backend === 'all' ? Object.keys(BACKEND_URLS) : [backend]) {
-        if (!await this.clients.loaded(target, 5000)) continue
+        const loaded = await this.clients.loaded(target, 5000)
+        let parked = false
+        if (mode === 'full' && target === 'qwen' && this.clients.status) {
+          try { parked = Boolean((await this.clients.status(target, 5000))?.parked_model) }
+          catch (error) { if (!isConnectionError(error)) throw error }
+        }
+        if (!loaded && !parked) continue
         resident.push(target)
-        if ((await this.clients.activity?.(target, 2000))?.busy)
+        if (loaded && (await this.clients.activity?.(target, 2000))?.busy)
           throw Object.assign(new Error(`${target} is still processing or has queued work. Wait before unloading.`), { code: 'busy' })
       }
       for (const target of resident) {
-        await this.clients.unload(target)
+        await this.clients.unload(target, mode)
         if (await this.clients.loaded(target, 5000)) throw new Error(`${target} still reports a resident model after unload.`)
+        if (mode === 'full' && target === 'qwen'
+          && (await this.clients.status?.(target, 5000))?.parked_model)
+          throw new Error('Qwen still reports model weights retained in RAM.')
         unloaded.push(target)
         if (this.currentBackend === target) this.currentBackend = null
       }
@@ -615,7 +637,16 @@ export class BackendGate {
 export function summarizeBackendStatus(name, status) {
   if (!status) return { state: 'starting' }
   if (name === 'maya') {
+    const live = status.activity ?? status.live
+    let activity
+    if (live && ['reading', 'generating', 'idle'].includes(live.state)) {
+      activity = { state: live.state }
+      for (const key of ['prompt_read', 'prompt_total', 'prompt_reused', 'prefill_tok_s_mean']) {
+        activity[key] = Number.isFinite(live[key]) && live[key] >= 0 ? live[key] : null
+      }
+    }
     return {
+      ...(activity ? { activity } : {}),
       state: status.unloaded === true ? 'unloaded'
         : status.status === 'reloading' || status.status === 'updating' ? status.status
           : status.status === 'ok' ? 'ready' : 'starting',
@@ -626,10 +657,10 @@ export function summarizeBackendStatus(name, status) {
   }
   if (name === 'qwen') {
     return {
-      state: status.loading_model ? 'loading'
+      state: status.loading_model ? 'loading' : status.parked_model ? 'parked'
         : status.active_model && status.engine_pid ? 'ready'
           : status.last_error ? 'error' : 'starting',
-      model: status.active_model ?? status.loading_model ?? null,
+      model: status.active_model ?? status.loading_model ?? status.parked_model ?? null,
       loading: Boolean(status.loading_model),
       engine: Boolean(status.engine_pid),
       error: status.last_error ?? null,

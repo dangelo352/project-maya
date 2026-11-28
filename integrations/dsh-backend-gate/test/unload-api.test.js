@@ -59,6 +59,37 @@ test('idle unload is idempotent and does not start any server', async () => {
   assert.equal((await f.gate.unloadIdle()).status, 'already_idle')
   assert.deepEqual(f.calls, [])
 })
+
+test('normal unload parks Qwen and full unload releases an already parked engine', async () => {
+  const f = fixture()
+  let parked = false
+  const modes = []
+  f.clients.unload = async (name, mode) => {
+    modes.push(mode)
+    f.resident.delete(name)
+    parked = mode === 'normal'
+  }
+  f.clients.status = async () => ({ parked_model: parked ? 'qwen3.8-27b' : null,
+    active_model: f.resident.has('qwen') ? 'qwen3.8-27b' : null,
+    engine_pid: f.resident.has('qwen') ? 42 : null })
+  await f.gate.unloadIdle('qwen', 'a', 'normal')
+  assert.equal((await f.gate.localStatusSnapshot()).backends.find(x => x.backend === 'qwen').state, 'parked')
+  await f.gate.unloadIdle('qwen', 'a', 'full')
+  assert.equal(parked, false)
+  assert.deepEqual(modes, ['normal', 'full'])
+})
+
+test('full unload refuses a backend that still claims RAM residency', async () => {
+  const f = fixture(); f.resident.clear()
+  f.clients.status = async () => ({ parked_model: 'qwen3.8-27b' })
+  await assert.rejects(f.gate.unloadIdle('qwen', 'a', 'full'), /retained in RAM/)
+})
+
+test('invalid unload mode is rejected before touching any backend', async () => {
+  const f = fixture()
+  await assert.rejects(f.gate.unloadIdle('qwen', 'a', 'pretend'), /Invalid unload mode/)
+  assert.deepEqual(f.calls, [])
+})
 test('active inference returns busy and never cancels the session or backend', async () => {
   const f = fixture()
   const release = await f.gate.acquire('hyperqwen-local', 'busy-session')
@@ -175,4 +206,32 @@ test('GET never mutates and unsupported methods/query strings are rejected', asy
   assert.equal((await f.handle(new Request('http://localhost/api/dsh-local-model?backend=qwen'))).status, 400)
   assert.equal((await f.handle(new Request('http://localhost/api/dsh-local-model', { method: 'DELETE' }))).status, 405)
   assert.deepEqual(f.calls, [])
+})
+
+
+test('API defaults to normal and forwards explicit unload modes and session unchanged', async () => {
+  for (const [body, expected] of [
+    [{}, ['all', undefined, 'normal']],
+    [{ backend: 'qwen', sessionId: 'park-session', mode: 'normal' }, ['qwen', 'park-session', 'normal']],
+    [{ backend: 'all', sessionId: 'release-session', mode: 'full' }, ['all', 'release-session', 'full']],
+  ]) {
+    const calls = []
+    const handle = createLocalModelHandler({ unloadIdle: async (...args) => {
+      calls.push(args)
+      return { ok: true, status: 'unloaded' }
+    } }, { csrfToken: TEST_TOKEN })
+    assert.equal((await handle(request(body))).status, 200)
+    assert.deepEqual(calls, [expected])
+  }
+})
+
+test('API rejects every invalid mode before gate dispatch', async () => {
+  const calls = []
+  const handle = createLocalModelHandler({ unloadIdle: async (...args) => { calls.push(args) } }, { csrfToken: TEST_TOKEN })
+  for (const mode of [null, '', 'FULL', 'park', false, 0, [], {}, ['normal']]) {
+    const result = await handle(request({ mode }))
+    assert.equal(result.status, 400)
+    assert.equal((await result.json()).error, 'invalid_request')
+  }
+  assert.deepEqual(calls, [])
 })
