@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { EngineTokenRate, METRIC_SOURCES, parseGeneratedTokens, createSnapshotHandler, apply } from '../index.js'
+import { EngineTokenRate, METRIC_SOURCES, parseGeneratedTokens, parseMayaRate, createSnapshotHandler, apply } from '../index.js'
 import { formatPill, pollIntervalMs } from '../client-src.js'
 
 test('parses exact generated-token counters for vLLM and Maya', () => {
@@ -31,12 +31,12 @@ test('supports both local engines and does not turn a restarted counter into fak
   let time = 10_000
   const counters = { qwen: 500, maya: 700, inkling: null }
   const rate = new EngineTokenRate({
-    sources: METRIC_SOURCES,
+    sources: METRIC_SOURCES.map(s => s.name === 'maya' ? { ...s, kind: 'maya' } : s),
     now: () => time,
     fetchImpl: async url => {
       const source = METRIC_SOURCES.find(item => item.url === url)
       if (counters[source.name] === null) throw new Error('offline')
-      const metric = source.kind === 'maya' ? 'llamacpp:tokens_predicted_total' : 'vllm:generation_tokens_total'
+      const metric = source.name === 'maya' ? 'llamacpp:tokens_predicted_total' : 'vllm:generation_tokens_total'
       return new Response(`${metric} ${counters[source.name]}`)
     },
   })
@@ -47,6 +47,26 @@ test('supports both local engines and does not turn a restarted counter into fak
   const reset = await rate.snapshot()
   assert.equal(reset.tps, 55)
   assert.equal(reset.state, 'live')
+})
+
+test('Maya uses live decode, never prefill or completion-total bursts', async () => {
+  let time = 1000
+  let live = {state: 'generating', tok_s: 99, prefill_tok_s_mean: 2000}
+  let total = 0
+  const rate = new EngineTokenRate({
+    sources: METRIC_SOURCES.filter(s => s.name === 'maya'), now: () => time,
+    fetchImpl: async () => Response.json({live, totals: {output_tokens: total}}),
+  })
+  assert.equal((await rate.snapshot()).tps, 99)
+  time += 1000; total = 8000; live = {state: 'idle', tok_s: null}
+  assert.equal((await rate.snapshot()).tps, 0)
+  time += 1000; live = {state: 'reading', tok_s: 2000, prefill_tok_s_mean: 2000}
+  assert.equal((await rate.snapshot()).tps, 0)
+  assert.equal(parseMayaRate({live: {state: 'generating', tok_s: -1}}), null)
+  assert.equal(parseMayaRate({live: {state: 'generating', tok_s: '99'}}), null)
+  assert.equal(parseMayaRate({live: {state: 'generating', tok_s: null}}), null)
+  assert.equal(parseMayaRate({live: {state: 'generating', tok_s: NaN}}), null)
+  assert.equal(parseMayaRate({}), null)
 })
 
 test('drops counters spanning a long disconnected gap instead of showing a false burst', async () => {

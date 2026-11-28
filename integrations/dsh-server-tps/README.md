@@ -1,12 +1,12 @@
 # DSH generated-token TPS pill
 
-This DeepSeek Harness profile plugin reports output TPS from cumulative counters exposed by the local inference engines. It does not infer token counts from stream chunks.
+This DeepSeek Harness profile plugin reports output TPS from native local inference metrics. It does not infer token counts from stream chunks or count prompt-prefill tokens as output.
 
 - Qwen/vLLM: `vllm:generation_tokens_total` from `127.0.0.1:18020/metrics`.
-- Maya/Inkling: `llamacpp:tokens_predicted_total` from `127.0.0.1:18022/metrics/prometheus`.
+- Maya/Inkling: `live.tok_s` from `127.0.0.1:18022/metrics`, only while `live.state` is `generating`. This is Maya's native rolling decode window (currently five seconds). Reading, idle and unloaded report zero output TPS. Missing or invalid decode metrics report unavailable.
 - HyperInkling: `vllm:generation_tokens_total` from `127.0.0.1:18023/metrics`.
 
-The plugin samples these counters when the authenticated DSH route is polled and reports the generated-token delta per second over a rolling window of up to two seconds. A counter reset establishes a new baseline, so a server restart cannot appear as a burst of generated tokens. Multiple open DSH clients share a throttled sample and do not distort the rate. Only the number and state are returned; no prompt, output text, model name, or session identifier is collected.
+For vLLM the plugin measures counter deltas over up to two seconds. Maya's Prometheus generated total updates on request completion: differencing that total caused false multi-thousand TPS bursts. The plugin now uses its live decode gauge instead. Multiple open DSH clients share a throttled sample. Rates are engine-wide, summed when multiple engines generate; they are not per-chat speeds. No prompt, output text, model name or session identifier is returned.
 
 The composer pill displays only `NN.N TPS`. It does not display active-stream counts. A reachable backend with no recent generated tokens displays `0.0 TPS`; if all three metric endpoints are unavailable, it displays `TPS unavailable`.
 

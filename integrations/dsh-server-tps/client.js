@@ -59,7 +59,7 @@ function formatPill(snapshot, now = Date.now()) {
   return {
     text: `${speed} TPS`,
     state: snapshot.state === "unavailable" ? "unavailable" : snapshot.state,
-    title: `Generated tokens per second, measured from local inference-engine counters over up to ${snapshot.window_ms || 2e3} ms`
+    title: "Live generated tokens per second from local engines (Qwen counter window; Maya native decode window). Excludes prompt prefill; shared across chats."
   };
 }
 function mount(React2, slots, fetchImpl = fetch) {
